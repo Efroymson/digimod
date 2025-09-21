@@ -1,0 +1,12 @@
+
+cmake_minimum_required(VERSION 3.16)
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(oscG)
+set(EXTRA_COMPONENT_DIRS components)
+set(TARGET esp32)
+
+# Explicitly add main directory sources
+file(GLOB_RECURSE SOURCES "main/*.cpp")
+idf_component_register(SRCS ${SOURCES}
+                       INCLUDE_DIRS "main" "components/pot_controller"
+                       REQUIRES driver esp_eth lwip)

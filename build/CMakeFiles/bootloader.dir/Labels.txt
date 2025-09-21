@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+/Users/robert/esp/digimod/oscG/build/CMakeFiles/bootloader
+/Users/robert/esp/digimod/oscG/build/CMakeFiles/bootloader.rule
+/Users/robert/esp/digimod/oscG/build/CMakeFiles/bootloader-complete.rule
+/Users/robert/esp/digimod/oscG/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+/Users/robert/esp/digimod/oscG/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+/Users/robert/esp/digimod/oscG/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+/Users/robert/esp/digimod/oscG/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+/Users/robert/esp/digimod/oscG/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+/Users/robert/esp/digimod/oscG/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+/Users/robert/esp/digimod/oscG/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule

@@ -1,0 +1,2 @@
+source /Users/robert/esp/digimod/oscG/build/bootloader/gdbinit/symbols
+source /Users/robert/esp/digimod/oscG/build/bootloader/gdbinit/connect
