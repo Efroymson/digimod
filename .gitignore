@@ -8,3 +8,21 @@ sdkconfig.old
 *.d
 .vscode/
 .idea/
+# Build directories
+build/
+sdkconfig.old
+
+# Python environment
+*.pyc
+__pycache__/
+
+# IDE files
+.vscode/
+.idea/
+
+# Temporary files
+*.bak
+*.log
+
+# ESP-IDF specific
+.espressif/
