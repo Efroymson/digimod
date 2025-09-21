@@ -12,6 +12,7 @@
 #include "lwip/sockets.h"
 #include "lwip/udp.h"
 #include "sdkconfig.h"  // For Kconfig defines
+#include "daisysp/daisysp.h"
 
 #include "pot_controller.h"  // Reused from your sketch
 #include "oscillator.h"     // New: Audio generation
