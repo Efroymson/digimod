@@ -1,7 +1,0 @@
-cmake_minimum_required(VERSION 3.16)
-include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(oscG)
-set(EXTRA_COMPONENT_DIRS components ../components/daisysp)
-idf_component_register(SRCS "main.cpp"  # Changed from plaits.cpp
-                       INCLUDE_DIRS "."
-                       REQUIRES control daisysp net freertos lwip nvs_flash driver)
