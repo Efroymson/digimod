@@ -53,8 +53,9 @@ extern "C" void app_main(void) {
     dest_addr.sin_addr.s_addr = inet_addr(UDP_IP); // Target IP for mcu.py
 
     printf("Starting UDP oscillator test on port %d\n", UDP_PORT);
-
-    while (1) {
+    int packet_count = 0;
+    
+	while (1) {
         float buffer[BLOCK_SIZE];
         for (int i = 0; i < BLOCK_SIZE; ++i) {
             buffer[i] = osc.Process();
@@ -62,11 +63,10 @@ extern "C" void app_main(void) {
         // Send buffer via UDP
         int sent = sendto(sock, buffer, BLOCK_SIZE * sizeof(float), 0,
                           (struct sockaddr*)&dest_addr, sizeof(dest_addr));
-        if (sent < 0) {
-            printf("UDP send failed\n");
-        } else {
-            printf("Sent %d bytes\n", sent);
-        }
+        if (sent > 0) packet_count++;
+		if (packet_count % 500 == 0) {
+		            printf("Sent %d packets\n", packet_count);
+		        }
         vTaskDelay(1 / portTICK_PERIOD_MS); // Avoid watchdog
     }
 
