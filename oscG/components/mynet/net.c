@@ -13,6 +13,7 @@
 #include "lwip/sys.h"
 #include "lwip/netdb.h"
 #include "lwip/dns.h"
+#include "lwip/ip_addr.h"  // Added for IPSTR and IP2STR
 #include "mynet.h"
 
 #define ETH_PHY_POWER 12  // Olimex ESP32-POE-ISO power pin
@@ -22,17 +23,17 @@
 #define ETH_MDIO_GPIO 18  // Olimex MDIO
 
 static SemaphoreHandle_t s_semph_get_ip_addrs = NULL;
-static esp_eth_handle_t s_eth_handle = NULL;
-static esp_netif_t* s_netif = NULL;
-static esp_eth_netif_glue_handle_t s_eth_glue = NULL;
+esp_eth_handle_t s_eth_handle = NULL;  // Made non-static for mynet.h visibility if needed
+esp_netif_t* s_netif;  // Single definition, initialized to NULL by default
+esp_eth_netif_glue_handle_t s_eth_glue = NULL;
 
 static void eth_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == ETH_EVENT && event_id == ETHERNET_EVENT_CONNECTED) {
         printf("Ethernet Link Up\n");
-        xSemaphoreGive(s_semph_get_ip_addrs);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
-        printf("Ethernet Got IP: " IPSTR "\n", IP2STR(&event->ip_info.ip));
+        printf("DEBUG: IP Event Received - Ethernet Got IP: " IPSTR "\n", IP2STR(&event->ip_info.ip));
+        xSemaphoreGive(s_semph_get_ip_addrs);  // Give only when IP is assigned
     }
 }
 
@@ -89,27 +90,29 @@ esp_err_t net_connect(void) {
     eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG(); // Correct macro for PHY config
     phy_config.phy_addr = ETH_PHY_ADDR;
     phy_config.reset_gpio_num = ETH_PHY_RST_GPIO;
-    esp_eth_phy_t* phy = esp_eth_phy_new_lan87xx(&phy_config); // Use lan87xx for LAN8720
+    esp_eth_phy_t* phy = esp_eth_phy_new_lan87xx(&phy_config); // Use lan87xx for LAN8720 (compatible with LAN8710A)
 
     esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, phy); // Correct usage with MAC and PHY
     ESP_ERROR_CHECK(esp_eth_driver_install(&config, &s_eth_handle));
 
     esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
     s_netif = esp_netif_new(&cfg);
+    if (s_netif == NULL) {
+        printf("DEBUG: Failed to create netif\n");
+        return ESP_FAIL;
+    }
     s_eth_glue = esp_eth_new_netif_glue(s_eth_handle);
     ESP_ERROR_CHECK(esp_netif_attach(s_netif, s_eth_glue));
 
     ESP_ERROR_CHECK(esp_eth_start(s_eth_handle));
 
-    if (s_semph_get_ip_addrs != NULL) {
-        if (xSemaphoreTake(s_semph_get_ip_addrs, portMAX_DELAY) == pdTRUE) {
-            printf("Ethernet connected\n");
-            return ESP_OK;
-        } else {
-            printf("Failed to get Ethernet IP\n");
-            return ESP_FAIL;
-        }
+    printf("Waiting for IP assignment...\n");
+    if (xSemaphoreTake(s_semph_get_ip_addrs, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        printf("IP assignment timeout\n");
+        return ESP_FAIL;
     }
+
+    printf("Ethernet connected with IP assigned, s_netif: %p\n", (void*)s_netif);
     return ESP_OK;
 }
 
