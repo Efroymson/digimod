@@ -10,8 +10,16 @@
 #include "lwip/inet.h"
 #include "mynet.h"
 #include "daisysp.h"
-
-
+// Macro to pack a 24-bit signed int into 3 bytes, big-endian (AES67 L24 compliant).
+// buffer: uint8_t[3] array to store the bytes.
+// value: signed 24-bit int (-8388608 to 8388607).
+// Portable: no host endian dependency.
+#define PACK_L24_BE(buffer, value) do { \
+    uint32_t uval = static_cast<uint32_t>(value); \
+    (buffer)[0] = static_cast<uint8_t>((uval >> 16) & 0xFFU); /* MSB */ \
+    (buffer)[1] = static_cast<uint8_t>((uval >> 8) & 0xFFU);  /* Middle byte */ \
+    (buffer)[2] = static_cast<uint8_t>(uval & 0xFFU);         /* LSB */ \
+} while(0)
 #define SAMPLE_RATE 48000
 #define BLOCK_SIZE 96
 #define UDP_PORT 5005
@@ -61,19 +69,20 @@ extern "C" void app_main(void) {
     int packet_count = 0;
 
     while (1) {
-        uint8_t buffer[PACKET_SIZE];
-        int offset = 0;
+		uint8_t buffer[PACKET_SIZE];
+		int offset = 0;
 
-        for (int i = 0; i < BLOCK_SIZE; ++i) {
-            float sample = osc.Process();
-            // Convert float [-1.0, 1.0] to 24-bit int [-8388608, 8388607]
-            int32_t value = (int32_t)(sample * 8388607.0f);
-            // Pack 24-bit int into 3 bytes (little-endian)
-            buffer[offset++] = value & 0xFF;
-            buffer[offset++] = (value >> 8) & 0xFF;
-            buffer[offset++] = (value >> 16) & 0xFF;
-        }
-
+		for (int i = 0; i < BLOCK_SIZE; ++i) {
+		    float sample = osc.Process();
+		    // Convert float [-1.0, 1.0] to 24-bit int [-8388608, 8388607]
+		    int32_t value = static_cast<int32_t>(sample * 8388607.0f);
+		    // Pack using big-endian macro (AES67 L24)
+		    uint8_t tmp[3];  // Must be an array (fix for your compile error)
+		    PACK_L24_BE(tmp, value);
+		    buffer[offset++] = tmp[0];
+		    buffer[offset++] = tmp[1];
+		    buffer[offset++] = tmp[2];
+		}
         // Send buffer via UDP
         int sent = sendto(sock, buffer, PACKET_SIZE, 0,
                           (struct sockaddr*)&dest_addr, sizeof(dest_addr));

@@ -1,5 +1,6 @@
 import socket
 import time
+import struct
 import sounddevice as sd
 import numpy as np
 
@@ -25,20 +26,19 @@ try:
     while True:
         data, addr = sock.recvfrom(PACKET_SIZE)
         if len(data) == PACKET_SIZE:
-            # Unpack 3-byte 24-bit signed ints (little-endian)
+            # Unpack 3-byte 24-bit signed ints (big-endian, AES67 L24)
             samples = []
             for i in range(0, PACKET_SIZE, 3):
-                value = data[i] | (data[i+1] << 8) | (data[i+2] << 16)
-                if value & 0x800000:
-                    value -= 0x1000000  # Sign extend for negative values
+                # Use struct to unpack big-endian 24-bit signed int
+                value = struct.unpack('>i', b'\x00' + data[i:i+3])[0]  # Prepend 0x00 to make 32-bit, unpack as signed big-endian
                 samples.append(value)
-           # print(f"Received {len(samples)} samples from {addr}: {samples[:5]}...")  # Print first 5 for debug
+            # print(f"Received {len(samples)} samples from {addr}: {samples[:5]}...")  # Print first 5 for debug
             # Play audio
             stream.write(np.array(samples, dtype=np.int32))
-           # time.sleep(len(samples) / SAMPLE_RATE)  # Wait for playback
+            # time.sleep(len(samples) / SAMPLE_RATE)  # Wait for playback
         else:
             print(f"Invalid packet size: {len(data)} bytes")
-
+            
 except KeyboardInterrupt:
     stream.stop()
     stream.close()
