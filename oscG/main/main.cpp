@@ -16,11 +16,15 @@
 #include "esp_log.h"
 #include "ui.h"
 
+#define TAG "OSC"
+
+// Forward declarations
 void sender_task(void* pvParameters);
 void receiver_task(void* pvParameters);
-void updateOscTask(void *pvParameters);
-void updateUITask(void *pvParameters);
+void updateOscTask(void* pvParameters);
+void updateUITask(void* pvParameters);
 
+// Define PACK_L24_BE if not in a header
 #ifndef PACK_L24_BE
 #define PACK_L24_BE(p, v) do { \
     (p)[0] = ((v) >> 16) & 0xFF; \
@@ -32,8 +36,8 @@ void updateUITask(void *pvParameters);
 #define SAMPLE_RATE 48000
 #define BLOCK_SIZE 96
 #define UDP_PORT 5005
-#define PACKET_SIZE (BLOCK_SIZE * 3)
-#define PRINT_INTERVAL 500
+#define PACKET_SIZE (BLOCK_SIZE * 3)  // 288 bytes for 96 24-bit samples
+#define PRINT_INTERVAL 500  // Print every 500 packets (~1 second)
 
 daisysp::Oscillator osc;
 
@@ -50,8 +54,7 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(net_connect());
 
-    // Initialize all UI components
-    initUI();    //xTaskCreate(updateADCTask, "updateADC", 2048, NULL, 5, NULL);  // Start ADC reading task
+    initUI();  // Initialize all UI components
 
     osc.Init(SAMPLE_RATE);
     osc.SetWaveform(daisysp::Oscillator::WAVE_SIN);
@@ -71,23 +74,32 @@ extern "C" void app_main(void) {
 
     xTaskCreate(sender_task, "sender_task", 4096, (void*)&multicast_ip, 5, NULL);
     xTaskCreate(receiver_task, "receiver_task", 4096, (void*)&multicast_ip, 5, NULL);
-    xTaskCreate(updateOscTask, "updateOsc", 2048, NULL, 5, NULL);  // Start oscillator update task
-	xTaskCreate(updateUITask, "updateUI", 2048, NULL, 5, NULL);   // UI update task
-	
-    // Minimize logging to reduce clicking
-	esp_log_level_set("UI", ESP_LOG_INFO);  // Enable INFO for pot mapping
-	esp_log_level_set("OSC", ESP_LOG_INFO);  // Enable OSC logging for debugging
-    
+    xTaskCreate(updateOscTask, "updateOsc", 2048, NULL, 5, NULL);  // Oscillator update task
+    xTaskCreate(updateUITask, "updateUI", 2048, NULL, 5, NULL);   // UI update task
+
+    // Example: Set some LEDs for testing (call after initUI)
+    for (int i = 0; i < DUAL_LED_COUNT; i++) {
+        blinkLED(i, slow, redGreen);  // Test dual-color blinking
+    }
+    for (int i = DUAL_LED_COUNT; i < LEDCOUNT; i++) {
+        blinkLED(i, fast, red);  // Test single-color blinking
+    }
+
+    esp_log_level_set("UI", ESP_LOG_WARN);  // Silence info/debug logging post-verification
+    esp_log_level_set(TAG, ESP_LOG_WARN);  // Silence OSC logging post-verification
+
+    // Task ends after initialization, scheduler takes over
 }
-// Oscillator update task
+
 void updateOscTask(void *pvParameters) {
+    static int last_adc1 = -1, last_adc5 = -1, last_adc3 = -1, last_adc6 = -1, last_adc7 = -1, last_adc8 = -1;
     while (1) {
-        int adc1_val = readADC1();  // Pot 1 for octave
-        int adc5_val = readADC5();  // Pot 5 for fine tune
-        int adc3_val = readADC3();  // Pot 3
-        int adc6_val = readADC6();  // Pot 6
-        int adc7_val = readADC7();  // Pot 7
-        int adc8_val = readADC8();  // Pot 8
+        int adc1_val = readADC(ADC1);  // Pot 1 for octave
+        int adc5_val = readADC(ADC5);  // Pot 5 for fine tune
+        int adc3_val = readADC(ADC3);  // Pot 3
+        int adc6_val = readADC(ADC6);  // Pot 6
+        int adc7_val = readADC(ADC7);  // Pot 7
+        int adc8_val = readADC(ADC8);  // Pot 8
         if (adc1_val != -1 && adc5_val != -1) {  // Prioritize octave and fine tune
             // Octave mapping
             int octave_step = adc1_val / 512;
@@ -100,14 +112,30 @@ void updateOscTask(void *pvParameters) {
             float final_freq = octave_base * fineAdj;
 
             osc.SetFreq(final_freq);
-            ESP_LOGI("OSC", "ADC1: %d (step %d, base %.2f), ADC5: %d (fine %.3f), Freq: %.2f Hz",
-                     adc1_val, octave_step, octave_base, adc5_val, fineAdj, final_freq);
+            if (abs(adc1_val - last_adc1) > HYSTERESIS_THRESHOLD || abs(adc5_val - last_adc5) > HYSTERESIS_THRESHOLD) {
+                ESP_LOGI(TAG, "ADC1: %d (step %d, base %.2f), ADC5: %d (fine %.3f), Freq: %.2f Hz",
+                         adc1_val, octave_step, octave_base, adc5_val, fineAdj, final_freq);
+                last_adc1 = adc1_val;
+                last_adc5 = adc5_val;
+            }
 
-            // Log additional pots for verification
-           /* if (adc3_val != -1) ESP_LOGI("OSC", "ADC3 (Pot 3, GPIO2): %d", adc3_val);
-            if (adc6_val != -1) ESP_LOGI("OSC", "ADC6 (Pot 6, GPIO14): %d", adc6_val);
-            if (adc7_val != -1) ESP_LOGI("OSC", "ADC7 (Pot 7, GPIO4): %d", adc7_val);
-            if (adc8_val != -1) ESP_LOGI("OSC", "ADC8 (Pot 8, GPIO15): %d", adc8_val); */
+            // Log additional pots only on significant change
+            if (adc3_val != -1 && abs(adc3_val - last_adc3) > HYSTERESIS_THRESHOLD) {
+                ESP_LOGI(TAG, "ADC3 (Pot 3, GPIO2): %d", adc3_val);
+                last_adc3 = adc3_val;
+            }
+            if (adc6_val != -1 && abs(adc6_val - last_adc6) > HYSTERESIS_THRESHOLD) {
+                ESP_LOGI(TAG, "ADC6 (Pot 6, GPIO14): %d", adc6_val);
+                last_adc6 = adc6_val;
+            }
+            if (adc7_val != -1 && abs(adc7_val - last_adc7) > HYSTERESIS_THRESHOLD) {
+                ESP_LOGI(TAG, "ADC7 (Pot 7, GPIO4): %d", adc7_val);
+                last_adc7 = adc7_val;
+            }
+            if (adc8_val != -1 && abs(adc8_val - last_adc8) > HYSTERESIS_THRESHOLD) {
+                ESP_LOGI(TAG, "ADC8 (Pot 8, GPIO15): %d", adc8_val);
+                last_adc8 = adc8_val;
+            }
         }
         vTaskDelay(10 / portTICK_PERIOD_MS);  // Faster update
     }
@@ -115,18 +143,36 @@ void updateOscTask(void *pvParameters) {
 
 // UI update task
 void updateUITask(void *pvParameters) {
-    const TickType_t update_interval = 50 / portTICK_PERIOD_MS;  // 50ms interval, configurable
+    const TickType_t update_interval = 10;  // 50ms interval in ticks
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    uint32_t led_value = 0;  // Initial LED pattern
 
     while (1) {
-        // Example: Toggle LEDs based on pot values (simple pattern)
-        if (readADC1() != -1) {
-            led_value = (led_value << 1) | 1;  // Shift and set LSB
-            if (led_value >= (1U << LEDCOUNT)) led_value = 1;  // Roll over
+        uint32_t led_value = 0;
+        for (int i = 0; i < LEDCOUNT; i++) {
+            if (LedState[i] == SET || LedState[i] == RESET) {
+                if (i < DUAL_LED_COUNT) {  // Dual-color LEDs (0-7)
+                    if (LedBlinkState[i]) led_value |= (1 << i);         // Red (bit i)
+                    if (LedBlinkState[i] || LedState[i] == SET) led_value |= (1 << (i + 8));  // Green (bit i + 8)
+                } else {  // Single-color LEDs (8-23)
+                    if (LedBlinkState[i] || LedState[i] == SET) led_value |= (1 << i);
+                }
+            }
         }
         shiftOutRegister(led_value);  // Update all LEDs
         vTaskDelayUntil(&xLastWakeTime, update_interval);
+
+        // Update blink states
+        uint32_t currentTime = xTaskGetTickCount();
+        if (currentTime - lastBlinkTime >= (LedState[0] == FAST_BLINK ? FAST_BLINK_INTERVAL : SLOW_BLINK_INTERVAL)) {
+            ESP_LOGD(TAG, "Updating blink states at time %lu", currentTime);  // Debug timing
+            for (int i = 0; i < LEDCOUNT; i++) {
+                if (LedState[i] == BLINK || LedState[i] == SLOW_BLINK || LedState[i] == FAST_BLINK) {
+                    LedBlinkState[i] = !LedBlinkState[i];
+                    ESP_LOGD(TAG, "LED %d blink state toggled to %d", i, LedBlinkState[i]);  // Debug toggle
+                }
+            }
+            lastBlinkTime = currentTime;
+        }
     }
 }
 
@@ -166,7 +212,7 @@ void sender_task(void* pvParameters) {
         int offset = 0;
         for (int i = 0; i < BLOCK_SIZE; ++i) {
             float sample = osc.Process();
-            int32_t value = static_cast<int32_t>(sample * 8388607.0f);
+            int32_t value = static_cast<int32_t>(sample * 8388607.0f);  // 24-bit range
             uint8_t tmp[3];
             PACK_L24_BE(tmp, value);
             buffer[offset++] = tmp[0];
@@ -181,7 +227,7 @@ void sender_task(void* pvParameters) {
         } else if (sent != PACKET_SIZE) {
             printf("Sender: Sent %d bytes, expected %d\n", sent, PACKET_SIZE);
         }
-        vTaskDelayUntil(&last_wake_time, 1);
+        vTaskDelayUntil(&last_wake_time, 1);  // 1ms delay
     }
     close(sock);
     vTaskDelete(NULL);
