@@ -1,292 +1,174 @@
 #include <stdio.h>
-#include <stdInt.h>
-#include <esp_timer.h>
+#include <stdint.h>
+#include <math.h>
 #include "esp_log.h"
 #include "driver/gpio.h"
-#include "driver/adc.h"
-#include "ui.h"
-#include "driver/timer.h"
+#include "esp_adc/adc_oneshot.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "ui.h"
 
-#define LEDCOUNT 		32 
-#define BUTTONSCOUNT 	16
+#define TAG "UI"
+#define HYSTERESIS_THRESHOLD 50  // Adjustable threshold for stability
 
-static const char *TAG = "UI";
+// Global variables for stable pot values
+static int stable_adc1 = -1;  // Pot 1 (GPIO36, octave)
+static int stable_adc3 = -1;  // Pot 3 (GPIO2)
+static int stable_adc5 = -1;  // Pot 5 (GPIO13, fine tune)
+static int stable_adc6 = -1;  // Pot 6 (GPIO14)
+static int stable_adc7 = -1;  // Pot 7 (GPIO4)
+static int stable_adc8 = -1;  // Pot 8 (GPIO15)
 
-void (*functionPtr)(uint8_t, PressType);
+// Pin definitions based on corrected mapping
+#define ADC1_GPIO GPIO_NUM_36  // Pot 1, ADC1_CH0
+#define ADC3_GPIO GPIO_NUM_2   // Pot 3, ADC2_CH2
+#define ADC5_GPIO GPIO_NUM_13  // Pot 5, ADC2_CH3
+#define ADC6_GPIO GPIO_NUM_14  // Pot 6, ADC2_CH6
+#define ADC7_GPIO GPIO_NUM_4   // Pot 7, ADC2_CH4 (corrected)
+#define ADC8_GPIO GPIO_NUM_15  // Pot 8, ADC2_CH0 (corrected)
 
-int rawValue;
-uint16_t currentState 		= 0;
-uint16_t previousState[16] 	= {0};
-uint64_t timerStart[16] 	= {0};
-uint64_t pressDuration[16] 	= {0};
-uint64_t lastPressTime[16] 	= {0};
-bool longPressDetected[16] 	= {false};
-int Adc_value[MAX_ADC] 		= {0};
+adc_oneshot_unit_handle_t adc1_handle;
+adc_oneshot_unit_handle_t adc2_handle;
 
-volatile bool LedStatus[LEDCOUNT] = {};
-volatile StateType LedState[LEDCOUNT] = {};
+void initMinimalADC(void) {
+    // Initialize ADC_UNIT_1 for ADC1
+    adc_oneshot_unit_init_cfg_t init_cfg1 = {
+        .unit_id = ADC_UNIT_1,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_cfg1, &adc1_handle));
+    ESP_LOGI(TAG, "ADC_UNIT_1 initialized");
 
-volatile bool buttonLastStatus[BUTTONSCOUNT] = {};
-volatile bool buttonCurrentStatus[BUTTONSCOUNT] = {};
+    // Initialize ADC_UNIT_2 for ADC3, ADC5, ADC6, ADC7, ADC8
+    adc_oneshot_unit_init_cfg_t init_cfg2 = {
+        .unit_id = ADC_UNIT_2,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_cfg2, &adc2_handle));
+    ESP_LOGI(TAG, "ADC_UNIT_2 initialized");
 
-uint64_t timerStart1;
-gpio_config_t io_conf;
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten = ADC_ATTEN_DB_12,  // 0-3.3V range
+        .bitwidth = ADC_BITWIDTH_12,  // 12-bit resolution (0-4095)
+    };
 
-void initButtonPotLED(uint8_t ButtonCount, uint8_t PotCount, uint8_t LEDCount, void (*f1)(uint8_t, PressType))
-{
-	functionPtr = f1;
-	io_conf.intr_type = GPIO_PIN_INTR_DISABLE;
-	io_conf.mode = GPIO_MODE_OUTPUT;
-	io_conf.pin_bit_mask = GPIO_OUTPUT_PIN_SEL;
-	io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-	io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-	gpio_config(&io_conf);
-	ESP_LOGE(TAG,"GPIO initilazation Done!...\n");
-	io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
-	io_conf.mode = GPIO_MODE_INPUT;
-	io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-	io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-	gpio_config(&io_conf);
-	adc1_config_width(ADC_WIDTH_BIT_12);
-	adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_11);//ADC1 
-	adc1_config_channel_atten(ADC1_CHANNEL_7, ADC_ATTEN_DB_11);//ADC2
-	adc2_config_channel_atten(ADC2_CHANNEL_3, ADC_ATTEN_11db);//ADC3
-	adc2_config_channel_atten(ADC2_CHANNEL_6, ADC_ATTEN_11db);//ADC4
-	adc2_config_channel_atten(ADC2_CHANNEL_4, ADC_ATTEN_11db);//ADC5
-	adc2_config_channel_atten(ADC2_CHANNEL_1, ADC_ATTEN_11db);//ADC6
-	adc2_config_channel_atten(ADC2_CHANNEL_2, ADC_ATTEN_11db);//ADC7
-	adc2_config_channel_atten(ADC2_CHANNEL_0, ADC_ATTEN_11db);//ADC8
-	xTaskCreatePinnedToCore(UpdateButtonPotLED, "UpdateButtonPotLED", 4096, NULL, 2, NULL, 0);
+    // Configure ADC1 (GPIO36 - ADC1_CH0)
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_0, &chan_cfg));
+    ESP_LOGI(TAG, "ADC1 configured on GPIO36 (Pot 1)");
+
+    // Configure ADC3 (GPIO2 - ADC2_CH2)
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, ADC_CHANNEL_2, &chan_cfg));
+    ESP_LOGI(TAG, "ADC3 configured on GPIO2 (Pot 3)");
+
+    // Configure ADC5 (GPIO13 - ADC2_CH3)
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, ADC_CHANNEL_3, &chan_cfg));
+    ESP_LOGI(TAG, "ADC5 configured on GPIO13 (Pot 5)");
+
+    // Configure ADC6 (GPIO14 - ADC2_CH6)
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, ADC_CHANNEL_6, &chan_cfg));
+    ESP_LOGI(TAG, "ADC6 configured on GPIO14 (Pot 6)");
+
+    // Configure ADC7 (GPIO4 - ADC2_CH4)
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, ADC_CHANNEL_4, &chan_cfg));
+    ESP_LOGI(TAG, "ADC7 configured on GPIO4 (Pot 7)");
+
+    // Configure ADC8 (GPIO15 - ADC2_CH0)
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, ADC_CHANNEL_0, &chan_cfg));
+    ESP_LOGI(TAG, "ADC8 configured on GPIO15 (Pot 8)");
 }
 
-uint16_t readShiftRegister(void)
-{
-    gpio_set_level(PIN_SHLD, 0);
-	gpio_set_level(PIN_CLK, 0);
-	gpio_set_level(PIN_CLK, 1);
-	//SHLD must be high to realize the shift function
-	gpio_set_level(PIN_SHLD, 1);
-	int16_t Switch_value = 0;
-	//Reading from QH
-	for(int i=0; i<BUTTONSCOUNT; i++)
-	{
-		if (gpio_get_level(PIN_QH)) 
-		{
-			Switch_value = Switch_value | (1<<i);
-		}
-		//CLK INH PIN must be low. Toggle CLK to shift data into QH
-		gpio_set_level(PIN_CLK, 0);
-		gpio_set_level(PIN_CLK, 1);
-	}
-    return Switch_value;
-}
-
-
-// Function to detect presses and return true or false for different press types
-bool buttonPressed(int switchNumber, PressType pressType) 
-{
-    currentState = readShiftRegister();
-
-    if (switchNumber < 1 || switchNumber > 16) 
-	{
-        // Invalid switch number, return false
-        return false;
+int readADC1(void) {  // Pot 1: Octave control
+    static int last_value = -1;
+    int value;
+    esp_err_t ret = adc_oneshot_read(adc1_handle, ADC_CHANNEL_0, &value);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ADC1 read failed: %s", esp_err_to_name(ret));
+        return -1;
     }
-	bool isPressDetected = false;
-    switch (pressType) 
-	{
-        case SHORT_PRESS:
-            if (currentState & (1 << (switchNumber - 1)) && !(previousState[switchNumber - 1] & (1 << (switchNumber - 1)))) 
-			{
-                // Short press detected
-				isPressDetected=true;
-            }
-            break;
-        case LONG_PRESS:
-			if (currentState & (1 << (switchNumber - 1)) && !(previousState[switchNumber - 1] & (1 << (switchNumber - 1)))) 
-			{
-				timerStart[switchNumber - 1] = esp_timer_get_time();
-			}
-            if (!(currentState & (1 << (switchNumber - 1))) && (previousState[switchNumber - 1] & (1 << (switchNumber - 1))) && !longPressDetected[switchNumber - 1]) 
-			{
-                // Long press detected
-				pressDuration[switchNumber - 1] = esp_timer_get_time() - timerStart[switchNumber -1 ]; // Calculate press duration
-				// Determine short or long press
-				if (pressDuration[switchNumber - 1] > 1000000) 
-				{ 
-					longPressDetected[switchNumber - 1] = true; // Set the long press flag
-					isPressDetected = true;
-				}
-			}	
-            else if (currentState & (1 << (switchNumber - 1)) && !(previousState[switchNumber - 1] & (1 << (switchNumber - 1)))) 
-			{
-                // The button has been released, clear the long press flag
-                longPressDetected[switchNumber - 1] = false;
-            }
-            break;
-        case DOUBLE_CLICK:
-            // Double-click detection logic
-            if (currentState & (1 << (switchNumber - 1)) && !(previousState[switchNumber - 1] & (1 << (switchNumber - 1)))) 
-			{
-                uint64_t timeSinceLastPress = esp_timer_get_time() - lastPressTime[switchNumber - 1];
-                if (timeSinceLastPress < DOUBLE_CLICK_THRESHOLD) 
-				{
-                    // Double click detected
-					isPressDetected=true;
-				}
-                lastPressTime[switchNumber - 1] = esp_timer_get_time();
-            }
-            break;
-        default:
-            break;
+    value = 4095 - value;  // Invert for correct CCW=4095, CW=0
+    if (abs(value - last_value) > HYSTERESIS_THRESHOLD || last_value == -1) {
+        last_value = value;
+        ESP_LOGD(TAG, "ADC1 (Pot 1, GPIO36) stable: %d", last_value);
     }
-
-    // Store the current state as the previous state for the next iteration
-    previousState[switchNumber - 1] = currentState;
-    // Press type not detected, return false
-    return isPressDetected;
+    return last_value;
 }
 
-
-void SetLedState(uint8_t LedNumber, StateType state)
-{
-	LedState[LedNumber-1] = state;
-	switch (state)
-	{
-		case SET:
-			{
-				LedStatus[LedNumber-1] = true;
-				break;
-			}
-		case RESET:
-			{
-				LedStatus[LedNumber-1] = false;
-				break;
-			}
-		default:
-			break;
-	}
+int readADC3(void) {  // Pot 3
+    static int last_value = -1;
+    int value;
+    esp_err_t ret = adc_oneshot_read(adc2_handle, ADC_CHANNEL_2, &value);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ADC3 read failed: %s", esp_err_to_name(ret));
+        return -1;
+    }
+    value = 4095 - value;  // Invert
+    if (abs(value - last_value) > HYSTERESIS_THRESHOLD || last_value == -1) {
+        last_value = value;
+        ESP_LOGD(TAG, "ADC3 (Pot 3, GPIO2) stable: %d", last_value);
+    }
+    return last_value;
 }
 
-void shiftOutRegister(uint32_t bits_value)
-	{
-		uint8_t i;
-		gpio_set_level(PIN_SET_D, 0); 
-		for (i=0; i<LEDCOUNT; i++)
-		{
-			bool bitValue = (bits_value >> i) & 0x01;
-			gpio_set_level(PIN_MOSI, !(bitValue)); // output left most bit ~ because commone anode
-            gpio_set_level(PIN_CLK, 0); //tickle clock
-            gpio_set_level(PIN_CLK, 1);
-		}
-		gpio_set_level(PIN_SET_D,1);
-		gpio_set_level(PIN_SET_D,0);
-	}
-
-static void UpdateButtonPotLED(void *ptr)
-{
-    const TickType_t taskPeriod = 50;
-    TickType_t xLastWakeTime;
-	xLastWakeTime = xTaskGetTickCount();
-    while (1) 
-	{
-		GetButtonsStatus();
-		UpdateLED();
-		UpdatePOT();
-		vTaskDelayUntil(&xLastWakeTime, taskPeriod);
-	}
+int readADC5(void) {  // Pot 5: Fine tune control
+    static int last_value = -1;
+    int value;
+    esp_err_t ret = adc_oneshot_read(adc2_handle, ADC_CHANNEL_3, &value);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ADC5 read failed: %s", esp_err_to_name(ret));
+        return -1;
+    }
+    value = 4095 - value;  // Invert
+    if (abs(value - last_value) > HYSTERESIS_THRESHOLD || last_value == -1) {
+        last_value = value;
+        ESP_LOGD(TAG, "ADC5 (Pot 5, GPIO13) stable: %d", last_value);
+    }
+    return last_value;
 }
 
-static void UpdateLED(void)
-{
-	static uint8_t wait;
-	for(int i=0; i<LEDCOUNT ;i++)
-	{
-		switch (LedState[i])
-		{
-		case BLINK:
-			{
-				if(wait == 10)
-				{
-					LedStatus[i] =! LedStatus[i];
-				}
-				break;
-			}
-		case SLOW_BLINK:
-			{
-				if(wait==5 || wait==10)
-				{
-					LedStatus[i] =! LedStatus[i];
-				}
-				break;
-			}
-		case FAST_BLINK:
-			{
-				
-				LedStatus[i] =! LedStatus[i];
-				break;
-			}
-		default:
-			break;
-		}
-
-		if(LedStatus[i])
-		{
-			LedRegValue = LedRegValue|((1<<i));
-		}
-		else
-		{
-			LedRegValue = LedRegValue&(~(1<<i));
-		}
-	}
-	shiftOutRegister(LedRegValue);
-	wait++;
-	if(wait == 11)
-	{
-		wait = 0;
-	}
+int readADC6(void) {  // Pot 6
+    static int last_value = -1;
+    int value;
+    esp_err_t ret = adc_oneshot_read(adc2_handle, ADC_CHANNEL_6, &value);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ADC6 read failed: %s", esp_err_to_name(ret));
+        return -1;
+    }
+    value = 4095 - value;  // Invert
+    if (abs(value - last_value) > HYSTERESIS_THRESHOLD || last_value == -1) {
+        last_value = value;
+        ESP_LOGD(TAG, "ADC6 (Pot 6, GPIO14) stable: %d", last_value);
+    }
+    return last_value;
 }
 
-static uint8_t GetButtonsStatus(void)
-{
-	uint16_t registerValue = readShiftRegister();
-	for(int i=0 ; i<BUTTONSCOUNT; i++)
-	{
-		buttonCurrentStatus[i] = (registerValue >> i) & 0x01;
-		if(buttonCurrentStatus[i] && (!buttonLastStatus[i]))
-		{
-			timerStart[i] = esp_timer_get_time();
-		}
-		if (!buttonCurrentStatus[i] && buttonLastStatus[i])
-		{
-			pressDuration[i] = esp_timer_get_time() - timerStart[i];
-			if(pressDuration[i] > 1000000)
-				{
-					ESP_LOGE(TAG,"B%d longe Pressed\n",i+1);
-					(*functionPtr)(i+1, LONG_PRESS);
-				}
-			else
-				{
-					ESP_LOGE(TAG,"B%d Short Pressed\n",i+1);
-					(*functionPtr)(i+1, SHORT_PRESS);
-				}
-		}
-		buttonLastStatus[i] = buttonCurrentStatus[i];
-	}
-	return 0;
+int readADC7(void) {  // Pot 7
+    static int last_value = -1;
+    int value;
+    esp_err_t ret = adc_oneshot_read(adc2_handle, ADC_CHANNEL_4, &value);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ADC7 read failed: %s", esp_err_to_name(ret));
+        return -1;
+    }
+    value = 4095 - value;  // Invert
+    if (abs(value - last_value) > HYSTERESIS_THRESHOLD || last_value == -1) {
+        last_value = value;
+        ESP_LOGD(TAG, "ADC7 (Pot 7, GPIO4) stable: %d", last_value);
+    }
+    return last_value;
 }
 
-void UpdatePOT(void)
-{
-	Adc_value[ADC1] = adc1_get_raw(ADC1_CHANNEL_0);
-	Adc_value[ADC2] = adc1_get_raw(ADC1_CHANNEL_7);
-	adc2_get_raw(ADC2_CHANNEL_2, ADC_WIDTH_12Bit, &Adc_value[ADC3]);
-	adc2_get_raw(ADC2_CHANNEL_1, ADC_WIDTH_12Bit, &Adc_value[ADC4]);	
-	adc2_get_raw(ADC2_CHANNEL_3, ADC_WIDTH_12Bit, &Adc_value[ADC5]);
-	adc2_get_raw(ADC2_CHANNEL_6, ADC_WIDTH_12Bit, &Adc_value[ADC6]);	
-	adc2_get_raw(ADC2_CHANNEL_4, ADC_WIDTH_12Bit, &Adc_value[ADC7]);
-	adc2_get_raw(ADC2_CHANNEL_0, ADC_WIDTH_12Bit, &Adc_value[ADC8]);	
+int readADC8(void) {  // Pot 8
+    static int last_value = -1;
+    int value;
+    esp_err_t ret = adc_oneshot_read(adc2_handle, ADC_CHANNEL_0, &value);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ADC8 read failed: %s", esp_err_to_name(ret));
+        return -1;
+    }
+    value = 4095 - value;  // Invert
+    if (abs(value - last_value) > HYSTERESIS_THRESHOLD || last_value == -1) {
+        last_value = value;
+        ESP_LOGD(TAG, "ADC8 (Pot 8, GPIO15) stable: %d", last_value);
+    }
+    return last_value;
 }
- 
