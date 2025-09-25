@@ -19,6 +19,7 @@
 void sender_task(void* pvParameters);
 void receiver_task(void* pvParameters);
 void updateOscTask(void *pvParameters);
+void updateUITask(void *pvParameters);
 
 #ifndef PACK_L24_BE
 #define PACK_L24_BE(p, v) do { \
@@ -49,8 +50,8 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(net_connect());
 
-    initMinimalADC();  // Initialize ADC1 and ADC2
-    //xTaskCreate(updateADCTask, "updateADC", 2048, NULL, 5, NULL);  // Start ADC reading task
+    // Initialize all UI components
+    initUI();    //xTaskCreate(updateADCTask, "updateADC", 2048, NULL, 5, NULL);  // Start ADC reading task
 
     osc.Init(SAMPLE_RATE);
     osc.SetWaveform(daisysp::Oscillator::WAVE_SIN);
@@ -71,6 +72,8 @@ extern "C" void app_main(void) {
     xTaskCreate(sender_task, "sender_task", 4096, (void*)&multicast_ip, 5, NULL);
     xTaskCreate(receiver_task, "receiver_task", 4096, (void*)&multicast_ip, 5, NULL);
     xTaskCreate(updateOscTask, "updateOsc", 2048, NULL, 5, NULL);  // Start oscillator update task
+	xTaskCreate(updateUITask, "updateUI", 2048, NULL, 5, NULL);   // UI update task
+	
     // Minimize logging to reduce clicking
 	esp_log_level_set("UI", ESP_LOG_INFO);  // Enable INFO for pot mapping
 	esp_log_level_set("OSC", ESP_LOG_INFO);  // Enable OSC logging for debugging
@@ -101,12 +104,29 @@ void updateOscTask(void *pvParameters) {
                      adc1_val, octave_step, octave_base, adc5_val, fineAdj, final_freq);
 
             // Log additional pots for verification
-            if (adc3_val != -1) ESP_LOGI("OSC", "ADC3 (Pot 3, GPIO2): %d", adc3_val);
+           /* if (adc3_val != -1) ESP_LOGI("OSC", "ADC3 (Pot 3, GPIO2): %d", adc3_val);
             if (adc6_val != -1) ESP_LOGI("OSC", "ADC6 (Pot 6, GPIO14): %d", adc6_val);
             if (adc7_val != -1) ESP_LOGI("OSC", "ADC7 (Pot 7, GPIO4): %d", adc7_val);
-            if (adc8_val != -1) ESP_LOGI("OSC", "ADC8 (Pot 8, GPIO15): %d", adc8_val);
+            if (adc8_val != -1) ESP_LOGI("OSC", "ADC8 (Pot 8, GPIO15): %d", adc8_val); */
         }
-        vTaskDelay(1000 / portTICK_PERIOD_MS);  // Faster update
+        vTaskDelay(10 / portTICK_PERIOD_MS);  // Faster update
+    }
+}
+
+// UI update task
+void updateUITask(void *pvParameters) {
+    const TickType_t update_interval = 50 / portTICK_PERIOD_MS;  // 50ms interval, configurable
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    uint32_t led_value = 0;  // Initial LED pattern
+
+    while (1) {
+        // Example: Toggle LEDs based on pot values (simple pattern)
+        if (readADC1() != -1) {
+            led_value = (led_value << 1) | 1;  // Shift and set LSB
+            if (led_value >= (1U << LEDCOUNT)) led_value = 1;  // Roll over
+        }
+        shiftOutRegister(led_value);  // Update all LEDs
+        vTaskDelayUntil(&xLastWakeTime, update_interval);
     }
 }
 

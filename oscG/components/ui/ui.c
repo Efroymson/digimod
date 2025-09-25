@@ -10,6 +10,7 @@
 
 #define TAG "UI"
 #define HYSTERESIS_THRESHOLD 50  // Adjustable threshold for stability
+#define LEDCOUNT 32  // Assuming 32 LEDs across 74HC595 chips
 
 // Global variables for stable pot values
 static int stable_adc1 = -1;  // Pot 1 (GPIO36, octave)
@@ -19,18 +20,38 @@ static int stable_adc6 = -1;  // Pot 6 (GPIO14)
 static int stable_adc7 = -1;  // Pot 7 (GPIO4)
 static int stable_adc8 = -1;  // Pot 8 (GPIO15)
 
-// Pin definitions based on corrected mapping
+// Pin definitions
 #define ADC1_GPIO GPIO_NUM_36  // Pot 1, ADC1_CH0
 #define ADC3_GPIO GPIO_NUM_2   // Pot 3, ADC2_CH2
 #define ADC5_GPIO GPIO_NUM_13  // Pot 5, ADC2_CH3
 #define ADC6_GPIO GPIO_NUM_14  // Pot 6, ADC2_CH6
-#define ADC7_GPIO GPIO_NUM_4   // Pot 7, ADC2_CH4 (corrected)
-#define ADC8_GPIO GPIO_NUM_15  // Pot 8, ADC2_CH0 (corrected)
+#define ADC7_GPIO GPIO_NUM_4   // Pot 7, ADC2_CH4
+#define ADC8_GPIO GPIO_NUM_15  // Pot 8, ADC2_CH0
+#define PIN_MOSI GPIO_NUM_32   // 74HC595 MOSI
+#define PIN_CLK  GPIO_NUM_16   // 74HC595 CLK
+#define PIN_SET_D GPIO_NUM_33  // 74HC595 Latch
+
+volatile bool LedStatus[LEDCOUNT] = {false};  // LED states
+volatile StateType LedState[LEDCOUNT] = {RESET};  // Initial state
 
 adc_oneshot_unit_handle_t adc1_handle;
 adc_oneshot_unit_handle_t adc2_handle;
 
-void initMinimalADC(void) {
+void initUI(void) {
+    // Configure GPIO for 74HC595
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = (1ULL << PIN_MOSI) | (1ULL << PIN_CLK) | (1ULL << PIN_SET_D),
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_DISABLE
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    ESP_LOGI(TAG, "GPIO configured for 74HC595 (MOSI:32, CLK:16, SET_D:33)");
+
+    // Initial LED state (all off)
+    shiftOutRegister(0);
+
     // Initialize ADC_UNIT_1 for ADC1
     adc_oneshot_unit_init_cfg_t init_cfg1 = {
         .unit_id = ADC_UNIT_1,
@@ -52,27 +73,17 @@ void initMinimalADC(void) {
         .bitwidth = ADC_BITWIDTH_12,  // 12-bit resolution (0-4095)
     };
 
-    // Configure ADC1 (GPIO36 - ADC1_CH0)
+    // Configure ADC channels
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_0, &chan_cfg));
     ESP_LOGI(TAG, "ADC1 configured on GPIO36 (Pot 1)");
-
-    // Configure ADC3 (GPIO2 - ADC2_CH2)
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, ADC_CHANNEL_2, &chan_cfg));
     ESP_LOGI(TAG, "ADC3 configured on GPIO2 (Pot 3)");
-
-    // Configure ADC5 (GPIO13 - ADC2_CH3)
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, ADC_CHANNEL_3, &chan_cfg));
     ESP_LOGI(TAG, "ADC5 configured on GPIO13 (Pot 5)");
-
-    // Configure ADC6 (GPIO14 - ADC2_CH6)
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, ADC_CHANNEL_6, &chan_cfg));
     ESP_LOGI(TAG, "ADC6 configured on GPIO14 (Pot 6)");
-
-    // Configure ADC7 (GPIO4 - ADC2_CH4)
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, ADC_CHANNEL_4, &chan_cfg));
     ESP_LOGI(TAG, "ADC7 configured on GPIO4 (Pot 7)");
-
-    // Configure ADC8 (GPIO15 - ADC2_CH0)
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, ADC_CHANNEL_0, &chan_cfg));
     ESP_LOGI(TAG, "ADC8 configured on GPIO15 (Pot 8)");
 }
@@ -85,7 +96,7 @@ int readADC1(void) {  // Pot 1: Octave control
         ESP_LOGE(TAG, "ADC1 read failed: %s", esp_err_to_name(ret));
         return -1;
     }
-    value = 4095 - value;  // Invert for correct CCW=4095, CW=0
+    value = 4095 - value;  // Invert
     if (abs(value - last_value) > HYSTERESIS_THRESHOLD || last_value == -1) {
         last_value = value;
         ESP_LOGD(TAG, "ADC1 (Pot 1, GPIO36) stable: %d", last_value);
@@ -171,4 +182,17 @@ int readADC8(void) {  // Pot 8
         ESP_LOGD(TAG, "ADC8 (Pot 8, GPIO15) stable: %d", last_value);
     }
     return last_value;
+}
+
+// Function to shift out data to 74HC595 for LEDs
+void shiftOutRegister(uint32_t bits_value) {
+    gpio_set_level(PIN_SET_D, 0);  // Latch low
+    for (uint8_t i = 0; i < LEDCOUNT; i++) {
+        bool bitValue = (bits_value >> (LEDCOUNT - 1 - i)) & 0x01;  // Shift from MSB to LSB
+        gpio_set_level(PIN_MOSI, bitValue);  // Data bit
+        gpio_set_level(PIN_CLK, 0);  // Clock low
+        gpio_set_level(PIN_CLK, 1);  // Clock high
+    }
+    gpio_set_level(PIN_SET_D, 1);  // Latch high
+    gpio_set_level(PIN_SET_D, 0);  // Latch low (optional reset)
 }
