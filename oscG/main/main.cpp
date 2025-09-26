@@ -31,9 +31,18 @@ void updateOscTask(void* pvParameters);
 #define BLOCK_SIZE 96
 #define UDP_PORT 5005
 #define PACKET_SIZE (BLOCK_SIZE * 3)
-#define PRINT_INTERVAL 500
+#define PRINT_INTERVAL 5000
 
 daisysp::Oscillator osc;
+
+// Global for task
+button_callback_t g_button_cb = NULL;
+
+void exampleButtonCb(uint8_t btn, PressType type) {
+    const char* type_str = (type == SHORT_PRESS ? "short" : (type == LONG_PRESS ? "long" : "double"));
+    ESP_LOGI(TAG, "Synth: Btn %d %s (e.g., route pot%d to osc freq via patchSave)", btn, type_str, btn);
+    // Future: switch(btn) { case 1: if(type==SHORT_PRESS) set_virtual_route(POT_ADC3, OSC_FREQ); }
+}
 
 extern "C" void app_main(void) {
     esp_err_t ret = nvs_flash_init();
@@ -48,10 +57,16 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(net_connect());
 
-    initUI();
+	initUI();
+	setUILogLevel(ESP_LOG_INFO);
 
+	setButtonCallback(exampleButtonCb);
+	testUI();  // Activates blinks
+	
     osc.Init(SAMPLE_RATE);
     osc.SetWaveform(daisysp::Oscillator::WAVE_SIN);
+	esp_log_level_set("OSC", ESP_LOG_WARN);
+
 
     esp_netif_ip_info_t ip_info;
     ESP_ERROR_CHECK(esp_netif_get_ip_info(s_netif, &ip_info));
@@ -72,25 +87,13 @@ extern "C" void app_main(void) {
 	if (xTaskCreatePinnedToCore(sender_task, "sender_task", 4096, (void*)&multicast_ip, 2, NULL, core_id) != pdPASS ||
 	        xTaskCreatePinnedToCore(receiver_task, "receiver_task", 4096, (void*)&multicast_ip, 2, NULL, core_id) != pdPASS ||
 	        xTaskCreatePinnedToCore(updateOscTask, "updateOsc", 4096, NULL, 3, &dummy_handle, core_id) != pdPASS ||
-	        xTaskCreatePinnedToCore(updateUITask, "updateUI", 4096, NULL, 3, &dummy_handle, core_id) != pdPASS) {
+			xTaskCreatePinnedToCore(updateUITask, "updateUI", 2048, NULL, 5, NULL, 1) !=pdPASS) // Pin to core 1
 	        ESP_LOGE(TAG, "Task creation failed - check memory");
-	    } else {
+	     else {
 	        ESP_LOGI(TAG, "Tasks created and pinned to core %d", core_id);
 	    }
 
-	    // Full blinking test for all 32 LEDs
-	    for (int i = 0; i < DUAL_LED_COUNT; i++) {
-	        blinkLED(i, slow, redGreen);  // Alternating red/green for dual LEDs 0-7
-	    }
-	    for (int i = DUAL_LED_COUNT; i < (DUAL_LED_COUNT + SINGLE_LED_COUNT); i++) {  // Include 23 (bit 31)
-	        blinkLED(i, fast, redGreen);  // Alternating blink for single LEDs 8-23
-	    }
-	    ESP_LOGI(TAG, "LED test set - expecting alternating red/green blink on 0-23, off on 24-31 if wired");
-
-	    esp_log_level_set("UI", ESP_LOG_INFO);
-	    esp_log_level_set(TAG, ESP_LOG_INFO);
 	}
-
 	void updateOscTask(void *pvParameters) {
 	    ESP_LOGI(TAG, "OSC task started on core %d", xPortGetCoreID());
 	    static int last_adc1 = -1, last_adc5 = -1;
@@ -105,11 +108,11 @@ extern "C" void app_main(void) {
 	            float fineAdj = 1.0f + (float)adc5_val / 4095.0f;
 	            float final_freq = octave_base * fineAdj;
 	            osc.SetFreq(final_freq);
-	            if (abs(adc1_val - last_adc1) > HYSTERESIS_THRESHOLD || abs(adc5_val - last_adc5) > HYSTERESIS_THRESHOLD) {
+	         /*   if (abs(adc1_val - last_adc1) > HYSTERESIS_THRESHOLD || abs(adc5_val - last_adc5) > HYSTERESIS_THRESHOLD) {
 	                ESP_LOGI(TAG, "Freq updated: %.2f Hz (ADC1=%d, ADC5=%d)", final_freq, adc1_val, adc5_val);
 	                last_adc1 = adc1_val;
 	                last_adc5 = adc5_val;
-	            }
+	            }*/
 	        }
 	        vTaskDelay(pdMS_TO_TICKS(10));  // Restore to 10ms for smooth tracking
 	    }
