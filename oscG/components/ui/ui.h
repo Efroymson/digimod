@@ -4,65 +4,38 @@
 #include <stdint.h>
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
-#include "freertos/FreeRTOS.h"  // For TickType_t and xTaskGetTickCount
+#include "freertos/FreeRTOS.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Enums for LED states and patterns
-typedef enum {
-    SET,
-    RESET,
-    BLINK,
-    SLOW_BLINK,
-    FAST_BLINK
-} StateType;
+typedef enum { SET, RESET } StateType;
+typedef enum { fast, slow } speed;
+typedef enum { redGreenYellow, redGreen, redYellow, greenYellow, red, green, yellow } colorPattern;
 
-typedef enum {
-    fast,
-    slow
-} speed;
-
-typedef enum {
-    redGreenYellow,
-    redGreen,
-    redYellow,
-    greenYellow,
-    red,
-    green,
-    yellow
-} colorPattern;
-
-// Constants
 #define LEDCOUNT 32
-#define DUAL_LED_COUNT 8  // First 8 dual-color LEDs
-#define BUTTONSCOUNT 16
-#define DOUBLE_CLICK_THRESHOLD 300000  // 300ms in microseconds (for future button use)
-#define HYSTERESIS_THRESHOLD 50  // Threshold for stable pot readings
-#define FAST_BLINK_INTERVAL 100  // 100ms for fast blink
-#define SLOW_BLINK_INTERVAL 500  // 500ms for slow blink
+#define DUAL_LED_COUNT 8
+#define SINGLE_LED_COUNT 24  // Adjusted for full 32 LEDs
+#define HYSTERESIS_THRESHOLD 50
+#define FAST_BLINK_INTERVAL_MS 100
+#define SLOW_BLINK_INTERVAL_MS 500
+#define UI_UPDATE_INTERVAL_MS 10  // 10ms update rate
 
-// ADC indices
-typedef enum {
-    ADC1 = 0,  // GPIO36
-    ADC3 = 1,  // GPIO2
-    ADC5 = 2,  // GPIO13
-    ADC6 = 3,  // GPIO14
-    ADC7 = 4,  // GPIO4
-    ADC8 = 5   // GPIO15
-} adc_index_t;
+typedef enum { ADC1 = 0, ADC3, ADC5, ADC6, ADC7, ADC8 } adc_index_t;
 
-// External globals for LED state (shared with updateUITask)
 extern volatile StateType LedState[LEDCOUNT];
 extern volatile bool LedBlinkState[LEDCOUNT];
+extern volatile uint32_t LedBlinkCount[LEDCOUNT];  // Count for blink timing
 extern uint32_t lastBlinkTime;
 
-// Function prototypes
-void initUI(void);  // Unified initialization for ADC, GPIO, and 74HC595
-int readADC(adc_index_t adcNum);  // Read ADC value for given index
-void shiftOutRegister(uint32_t bits_value);  // LED update function
-void blinkLED(uint8_t ledNum, speed blinkSpeed, colorPattern pattern);  // LED control API
+void initUI(void);
+int readADC(adc_index_t adcNum);
+void shiftOutRegister(uint32_t bits_value);
+void setLedBitState(uint8_t bitNum, StateType state);
+void blinkLedBit(uint8_t bitNum, speed blinkSpeed);
+void blinkLED(uint8_t ledNum, speed blinkSpeed, colorPattern pattern);
+void updateUITask(void *pvParameters);
 
 #ifdef __cplusplus
 }

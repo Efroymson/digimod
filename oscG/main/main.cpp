@@ -1,3 +1,4 @@
+// main.cpp
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -18,26 +19,19 @@
 
 #define TAG "OSC"
 
-// Forward declarations
 void sender_task(void* pvParameters);
 void receiver_task(void* pvParameters);
 void updateOscTask(void* pvParameters);
-void updateUITask(void* pvParameters);
 
-// Define PACK_L24_BE if not in a header
 #ifndef PACK_L24_BE
-#define PACK_L24_BE(p, v) do { \
-    (p)[0] = ((v) >> 16) & 0xFF; \
-    (p)[1] = ((v) >> 8) & 0xFF;  \
-    (p)[2] = (v) & 0xFF;         \
-} while (0)
+#define PACK_L24_BE(p, v) do { (p)[0] = ((v) >> 16) & 0xFF; (p)[1] = ((v) >> 8) & 0xFF; (p)[2] = (v) & 0xFF; } while (0)
 #endif
 
 #define SAMPLE_RATE 48000
 #define BLOCK_SIZE 96
 #define UDP_PORT 5005
-#define PACKET_SIZE (BLOCK_SIZE * 3)  // 288 bytes for 96 24-bit samples
-#define PRINT_INTERVAL 500  // Print every 500 packets (~1 second)
+#define PACKET_SIZE (BLOCK_SIZE * 3)
+#define PRINT_INTERVAL 500
 
 daisysp::Oscillator osc;
 
@@ -54,7 +48,7 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(net_connect());
 
-    initUI();  // Initialize all UI components
+    initUI();
 
     osc.Init(SAMPLE_RATE);
     osc.SetWaveform(daisysp::Oscillator::WAVE_SIN);
@@ -66,116 +60,60 @@ extern "C" void app_main(void) {
 
     uint8_t* ip_bytes = (uint8_t*)&unicast_ip;
     uint32_t multicast_ip = (239 << 24) | (100 << 16) | (ip_bytes[2] << 8) | ip_bytes[3];
-    printf("Computed multicast address: %lu.%lu.%lu.%lu\n",
+    printf("Multicast: %lu.%lu.%lu.%lu\n",
            (unsigned long)((multicast_ip >> 24) & 0xFF),
            (unsigned long)((multicast_ip >> 16) & 0xFF),
            (unsigned long)((multicast_ip >> 8) & 0xFF),
            (unsigned long)(multicast_ip & 0xFF));
 
-    xTaskCreate(sender_task, "sender_task", 4096, (void*)&multicast_ip, 5, NULL);
-    xTaskCreate(receiver_task, "receiver_task", 4096, (void*)&multicast_ip, 5, NULL);
-    xTaskCreate(updateOscTask, "updateOsc", 2048, NULL, 5, NULL);  // Oscillator update task
-    xTaskCreate(updateUITask, "updateUI", 2048, NULL, 5, NULL);   // UI update task
+    BaseType_t core_id = 0;
+    TaskHandle_t dummy_handle;
 
-    // Example: Set some LEDs for testing (call after initUI)
-    for (int i = 0; i < DUAL_LED_COUNT; i++) {
-        blinkLED(i, slow, redGreen);  // Test dual-color blinking
-    }
-    for (int i = DUAL_LED_COUNT; i < LEDCOUNT; i++) {
-        blinkLED(i, fast, red);  // Test single-color blinking
-    }
+	if (xTaskCreatePinnedToCore(sender_task, "sender_task", 4096, (void*)&multicast_ip, 2, NULL, core_id) != pdPASS ||
+	        xTaskCreatePinnedToCore(receiver_task, "receiver_task", 4096, (void*)&multicast_ip, 2, NULL, core_id) != pdPASS ||
+	        xTaskCreatePinnedToCore(updateOscTask, "updateOsc", 4096, NULL, 3, &dummy_handle, core_id) != pdPASS ||
+	        xTaskCreatePinnedToCore(updateUITask, "updateUI", 4096, NULL, 3, &dummy_handle, core_id) != pdPASS) {
+	        ESP_LOGE(TAG, "Task creation failed - check memory");
+	    } else {
+	        ESP_LOGI(TAG, "Tasks created and pinned to core %d", core_id);
+	    }
 
-    esp_log_level_set("UI", ESP_LOG_WARN);  // Silence info/debug logging post-verification
-    esp_log_level_set(TAG, ESP_LOG_WARN);  // Silence OSC logging post-verification
+	    // Full blinking test for all 32 LEDs
+	    for (int i = 0; i < DUAL_LED_COUNT; i++) {
+	        blinkLED(i, slow, redGreen);  // Alternating red/green for dual LEDs 0-7
+	    }
+	    for (int i = DUAL_LED_COUNT; i < (DUAL_LED_COUNT + SINGLE_LED_COUNT); i++) {  // Include 23 (bit 31)
+	        blinkLED(i, fast, redGreen);  // Alternating blink for single LEDs 8-23
+	    }
+	    ESP_LOGI(TAG, "LED test set - expecting alternating red/green blink on 0-23, off on 24-31 if wired");
 
-    // Task ends after initialization, scheduler takes over
-}
+	    esp_log_level_set("UI", ESP_LOG_INFO);
+	    esp_log_level_set(TAG, ESP_LOG_INFO);
+	}
 
-void updateOscTask(void *pvParameters) {
-    static int last_adc1 = -1, last_adc5 = -1, last_adc3 = -1, last_adc6 = -1, last_adc7 = -1, last_adc8 = -1;
-    while (1) {
-        int adc1_val = readADC(ADC1);  // Pot 1 for octave
-        int adc5_val = readADC(ADC5);  // Pot 5 for fine tune
-        int adc3_val = readADC(ADC3);  // Pot 3
-        int adc6_val = readADC(ADC6);  // Pot 6
-        int adc7_val = readADC(ADC7);  // Pot 7
-        int adc8_val = readADC(ADC8);  // Pot 8
-        if (adc1_val != -1 && adc5_val != -1) {  // Prioritize octave and fine tune
-            // Octave mapping
-            int octave_step = adc1_val / 512;
-            octave_step = (octave_step > 7) ? 7 : octave_step;
-            float base_freq[] = {130.81f, 261.63f, 523.25f, 1046.50f, 2093.00f, 4186.01f, 8372.02f, 16744.04f};
-            float octave_base = base_freq[octave_step];
-
-            // Fine tune with Pot 5
-            float fineAdj = 1.0f + (float)adc5_val / 4095.0f;  // 1.0 to 2.0 range
-            float final_freq = octave_base * fineAdj;
-
-            osc.SetFreq(final_freq);
-            if (abs(adc1_val - last_adc1) > HYSTERESIS_THRESHOLD || abs(adc5_val - last_adc5) > HYSTERESIS_THRESHOLD) {
-                ESP_LOGI(TAG, "ADC1: %d (step %d, base %.2f), ADC5: %d (fine %.3f), Freq: %.2f Hz",
-                         adc1_val, octave_step, octave_base, adc5_val, fineAdj, final_freq);
-                last_adc1 = adc1_val;
-                last_adc5 = adc5_val;
-            }
-
-            // Log additional pots only on significant change
-            if (adc3_val != -1 && abs(adc3_val - last_adc3) > HYSTERESIS_THRESHOLD) {
-                ESP_LOGI(TAG, "ADC3 (Pot 3, GPIO2): %d", adc3_val);
-                last_adc3 = adc3_val;
-            }
-            if (adc6_val != -1 && abs(adc6_val - last_adc6) > HYSTERESIS_THRESHOLD) {
-                ESP_LOGI(TAG, "ADC6 (Pot 6, GPIO14): %d", adc6_val);
-                last_adc6 = adc6_val;
-            }
-            if (adc7_val != -1 && abs(adc7_val - last_adc7) > HYSTERESIS_THRESHOLD) {
-                ESP_LOGI(TAG, "ADC7 (Pot 7, GPIO4): %d", adc7_val);
-                last_adc7 = adc7_val;
-            }
-            if (adc8_val != -1 && abs(adc8_val - last_adc8) > HYSTERESIS_THRESHOLD) {
-                ESP_LOGI(TAG, "ADC8 (Pot 8, GPIO15): %d", adc8_val);
-                last_adc8 = adc8_val;
-            }
-        }
-        vTaskDelay(10 / portTICK_PERIOD_MS);  // Faster update
-    }
-}
-
-// UI update task
-void updateUITask(void *pvParameters) {
-    const TickType_t update_interval = 10;  // 50ms interval in ticks
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-
-    while (1) {
-        uint32_t led_value = 0;
-        for (int i = 0; i < LEDCOUNT; i++) {
-            if (LedState[i] == SET || LedState[i] == RESET) {
-                if (i < DUAL_LED_COUNT) {  // Dual-color LEDs (0-7)
-                    if (LedBlinkState[i]) led_value |= (1 << i);         // Red (bit i)
-                    if (LedBlinkState[i] || LedState[i] == SET) led_value |= (1 << (i + 8));  // Green (bit i + 8)
-                } else {  // Single-color LEDs (8-23)
-                    if (LedBlinkState[i] || LedState[i] == SET) led_value |= (1 << i);
-                }
-            }
-        }
-        shiftOutRegister(led_value);  // Update all LEDs
-        vTaskDelayUntil(&xLastWakeTime, update_interval);
-
-        // Update blink states
-        uint32_t currentTime = xTaskGetTickCount();
-        if (currentTime - lastBlinkTime >= (LedState[0] == FAST_BLINK ? FAST_BLINK_INTERVAL : SLOW_BLINK_INTERVAL)) {
-            ESP_LOGD(TAG, "Updating blink states at time %lu", currentTime);  // Debug timing
-            for (int i = 0; i < LEDCOUNT; i++) {
-                if (LedState[i] == BLINK || LedState[i] == SLOW_BLINK || LedState[i] == FAST_BLINK) {
-                    LedBlinkState[i] = !LedBlinkState[i];
-                    ESP_LOGD(TAG, "LED %d blink state toggled to %d", i, LedBlinkState[i]);  // Debug toggle
-                }
-            }
-            lastBlinkTime = currentTime;
-        }
-    }
-}
-
+	void updateOscTask(void *pvParameters) {
+	    ESP_LOGI(TAG, "OSC task started on core %d", xPortGetCoreID());
+	    static int last_adc1 = -1, last_adc5 = -1;
+	    while (1) {
+	        int adc1_val = readADC(ADC1);
+	        int adc5_val = readADC(ADC5);
+	        if (adc1_val != -1 && adc5_val != -1) {
+	            int octave_step = adc1_val / 512;
+	            octave_step = (octave_step > 7) ? 7 : octave_step;
+	            float base_freq[] = {130.81f, 261.63f, 523.25f, 1046.50f, 2093.00f, 4186.01f, 8372.02f, 16744.04f};
+	            float octave_base = base_freq[octave_step];
+	            float fineAdj = 1.0f + (float)adc5_val / 4095.0f;
+	            float final_freq = octave_base * fineAdj;
+	            osc.SetFreq(final_freq);
+	            if (abs(adc1_val - last_adc1) > HYSTERESIS_THRESHOLD || abs(adc5_val - last_adc5) > HYSTERESIS_THRESHOLD) {
+	                ESP_LOGI(TAG, "Freq updated: %.2f Hz (ADC1=%d, ADC5=%d)", final_freq, adc1_val, adc5_val);
+	                last_adc1 = adc1_val;
+	                last_adc5 = adc5_val;
+	            }
+	        }
+	        vTaskDelay(pdMS_TO_TICKS(10));  // Restore to 10ms for smooth tracking
+	    }
+	}
 void sender_task(void* pvParameters) {
     uint32_t multicast_ip = *(uint32_t*)pvParameters;
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
