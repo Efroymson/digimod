@@ -26,10 +26,6 @@ uint32_t lastBlinkTime = 0;
 // Chetu-style button globals
 static bool buttonCurrentStatus[BUTTONSCOUNT] = {false};
 static bool buttonLastStatus[BUTTONSCOUNT] = {false};
-static uint64_t timerStart[BUTTONSCOUNT] = {0};
-static uint64_t pressDuration[BUTTONSCOUNT] = {0};
-static uint64_t lastPressTime[BUTTONSCOUNT] = {0};
-static bool longPressDetected[BUTTONSCOUNT] = {false};
 static uint16_t prev_button_state = 0;  // For reg change log
 static button_callback_t g_button_cb = NULL;  // Global cb
 
@@ -73,9 +69,6 @@ static uint16_t readButtonRegister(void) {
     return switch_value;
 }
 
-/**
- * @brief Chetu-style GetButtonsStatus: Read reg, detect edges, fire cb.
- */
 static void pollButtons(void) {
     if (!g_button_cb) {
         ESP_LOGW(TAG, "No button cb set");  // One-time
@@ -83,7 +76,12 @@ static void pollButtons(void) {
     }
 
     static bool first_poll = true;
+    static bool is_long_press[BUTTONSCOUNT] = {false};
+    static uint64_t press_start_time[BUTTONSCOUNT] = {0};
+
     uint16_t registerValue = readButtonRegister();
+    uint64_t current_time = esp_timer_get_time();
+
     if (first_poll || registerValue != prev_button_state) {
         ESP_LOGI(TAG, "Button reg: 0x%04x", registerValue);
         first_poll = false;
@@ -92,25 +90,28 @@ static void pollButtons(void) {
     for (int i = 0; i < BUTTONSCOUNT; i++) {
         buttonCurrentStatus[i] = (registerValue >> i) & 0x01;
 
-        if (buttonCurrentStatus[i] && !buttonLastStatus[i]) {  // Press edge
-            timerStart[i] = esp_timer_get_time();
-            // Double-click (chetu buttonPressed)
-            uint64_t timeSinceLast = esp_timer_get_time() - lastPressTime[i];
-            if (timeSinceLast < DOUBLE_CLICK_THRESHOLD_US) {
-                g_button_cb((uint8_t)(i + 1), DOUBLE_CLICK);
-            }
-            lastPressTime[i] = esp_timer_get_time();
+        // Press edge
+        if (buttonCurrentStatus[i] && !buttonLastStatus[i]) {
+            press_start_time[i] = current_time;
+            is_long_press[i] = false;
         }
 
-        if (!buttonCurrentStatus[i] && buttonLastStatus[i]) {  // Release edge
-            pressDuration[i] = esp_timer_get_time() - timerStart[i];
-            if (pressDuration[i] > LONG_PRESS_THRESHOLD_US) {
-                longPressDetected[i] = true;
+        // Held (continuous press)
+        if (buttonCurrentStatus[i] && buttonLastStatus[i]) {
+            if (!is_long_press[i] &&
+                (current_time - press_start_time[i] > LONG_PRESS_THRESHOLD_US)) {
+                is_long_press[i] = true;  // Mark but don't trigger yet
+            }
+        }
+
+        // Release edge
+        if (!buttonCurrentStatus[i] && buttonLastStatus[i]) {
+            uint64_t duration = current_time - press_start_time[i];
+            if (is_long_press[i] || duration > LONG_PRESS_THRESHOLD_US) {
                 g_button_cb((uint8_t)(i + 1), LONG_PRESS);
             } else {
                 g_button_cb((uint8_t)(i + 1), SHORT_PRESS);
             }
-            longPressDetected[i] = false;  // Reset
         }
 
         buttonLastStatus[i] = buttonCurrentStatus[i];
