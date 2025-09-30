@@ -12,6 +12,9 @@ The master unit is built on the Olimex ESP32-POE-ISO board, with a custom PCB fo
 - **UI**:
   - LEDs: 8 dual-color (red/green for yellow via 74HC595 chain, bits 0-7 red, 8-15 green) + 16 single (bits 16-31). Common-anode, inverted MOSI (GPIO32), CLK (GPIO16), latch (GPIO33).
   - Buttons: 16 via 74HC165 parallel-in serial-out (PL latch GPIO3 output, CLK GPIO16, Q7 serial out GPIO5 input). External 10k pull-ups, switches to GND (high=pressed).
+  ## UI Component Note: Button-LED Mapping
+  The 16 single-color LEDs (bits 16-31 in the 32-bit shift register) are logically reversed relative to the 16 buttons (1-16 via 74HC165). Specifically, button `n` (1-16) corresponds to LED bit `(17 - n) + 15`, mapping button 1 to LED 31, button 2 to LED 30, ..., button 16 to LED 16. This reversal is due to the PCB layout or shift register chain orientation (schematic reference: shem-uw10.pdf, page 1). Software compensates via the mapping formula in `exampleButtonCb` (main.cpp), ensuring intuitive operation where a short press on button `n` blinks the corresponding LED, and a long press stops it. Users should align physical labeling accordingly during assembly or Eurorack integration to avoid confusion.
+  
   - Pots (CV Inputs): 6 ADCs (GPIO36/2/13/14/4/15, 12-bit, 11dB atten, inverted hardware).
 - **Power**: 3.3V rails from PoE converter; stable for analog/digital separation.
 
