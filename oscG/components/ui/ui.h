@@ -100,7 +100,7 @@ void blinkLED(uint8_t ledNum, speed blinkSpeed, colorPattern pattern);
 
 void updateUITask(void *pvParameters);
 void setUILogLevel(esp_log_level_t level);
-void testUI(void);  // LED test only (buttons always polled post-init)
+void testUI(void *);  // LED test only (buttons always polled post-init)
 
 /**
  * @brief Set global button callback (call in app_main before UI task).

@@ -419,17 +419,28 @@ void setButtonCallback(button_callback_t cb) {
     ESP_LOGI(TAG, "Button cb set");
 }
 
-void testUI(void) {
+void testUI(void *) {
     // Demo simple API
+	while (1){
     for (uint8_t i = 0; i < DUAL_LED_COUNT-5; i++) {
         setLedState(i, LED_BLINK_SLOW);  // Dual slow blink (yellow/redGreenYellow)
-    }
+    	}
     for (uint8_t i = DUAL_LED_COUNT; i < (DUAL_LED_COUNT + SINGLE_LED_COUNT-10); i++) {
         setLedState(i, LED_BLINK_FAST);
-    }
+    	}
     ESP_LOGI(TAG, "LED test activated with simple API");
+	vTaskDelay(pdMS_TO_TICKS(1000));  // change every second
+	for (uint8_t i = 5; i < DUAL_LED_COUNT; i++) {
+	        blinkLED(i, LED_BLINK_FAST, greenYellow);  // Dual slow blink (yellow/redGreenYellow)
+	    	}
+	    for (uint8_t i = DUAL_LED_COUNT+10; i < (DUAL_LED_COUNT + SINGLE_LED_COUNT); i++) {
+	        setLedState(i, LED_BLINK_SLOW);
+	    	}
+	    ESP_LOGI(TAG, "LED test activated with different simple API");
+		vTaskDelay(pdMS_TO_TICKS(1000));  // change every second
+	
+	}
 }
-
 void updateUITask(void *pvParameters) {
     ESP_LOGI(TAG, "UI task started on core %d", xPortGetCoreID());
     TickType_t last_wake = xTaskGetTickCount();

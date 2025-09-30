@@ -71,7 +71,7 @@ extern "C" void app_main(void) {
     setUILogLevel(ESP_LOG_INFO);
     //shiftOutRegister(ox0);
     setButtonCallback(exampleButtonCb);
-    testUI();  // Activates blinks
+    //testUI();  // use only for testing board
 
     // Initialize oscillators
     osc_saw.Init(SAMPLE_RATE);

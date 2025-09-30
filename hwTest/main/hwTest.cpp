@@ -45,7 +45,7 @@ extern "C" void app_main(void) {
     setUILogLevel(ESP_LOG_WARN);
     //shiftOutRegister(ox0);
     setButtonCallback(exampleButtonCb);
-    testUI();  // Activates blinks
+    //testUI();  // Activates blinks now must be in task, as it runs in a while
 
     ESP_ERROR_CHECK(esp_netif_get_ip_info(s_netif, &ip_info));
     uint32_t unicast_ip = ip_info.ip.addr;
@@ -63,7 +63,8 @@ extern "C" void app_main(void) {
     TaskHandle_t dummy_handle;
 
        if ( xTaskCreatePinnedToCore(hwTestTask, "hwTest", 4096, NULL, 3, &dummy_handle, core_id) != pdPASS ||
-        xTaskCreatePinnedToCore(updateUITask, "updateUI", 2048, NULL, 5, NULL, 1) != pdPASS) {  // Pin to core 1
+        xTaskCreatePinnedToCore(updateUITask, "updateUI", 2048, NULL, 5, NULL, 1) != pdPASS ||
+        xTaskCreatePinnedToCore(testUI, "testUI", 2048, NULL, 5, NULL, 1) != pdPASS) {  // Pin to core 1
         ESP_LOGE(TAG, "Task creation failed - check memory");
     } else {
         ESP_LOGI(TAG, "Tasks created and pinned to core %d", core_id);
