@@ -71,7 +71,7 @@ extern "C" void app_main(void) {
     setUILogLevel(ESP_LOG_INFO);
     //shiftOutRegister(ox0);
     setButtonCallback(exampleButtonCb);
-    //testUI();  // Activates blinks
+    testUI();  // Activates blinks
 
     // Initialize oscillators
     osc_saw.Init(SAMPLE_RATE);
@@ -108,50 +108,49 @@ extern "C" void app_main(void) {
 
 void updateOscTask(void *pvParameters) {
     ESP_LOGI(TAG, "OSC task started on core %d", xPortGetCoreID());
-    static int last_adc1 = -1, last_adc6 = -1, last_adc5 = -1, last_adc7 = -1, last_adc8 = -1;  // Changed ADC3 to ADC6
     TickType_t last_adc_log_time = xTaskGetTickCount();
 
     while (1) {
-        int adc1_val = readADC(ADC1);  // Octave
-        int adc6_val = readADC(ADC6);  // Balance (replaced ADC3)
-        int adc5_val = readADC(ADC5);  // Fine tune
-        int adc7_val = readADC(ADC7);  // Pulse width
-        int adc8_val = readADC(ADC8);  // Detune
+		float adc1_val = readKnob(KNOB1); // Octave (GPIO36)
+		float adc3_val = readKnob(KNOB3); // Balance (GPIO2)
+		float adc5_val = readKnob(KNOB5); // Fine tune (GPIO15)
+		float adc7_val = readKnob(KNOB7); // Pulse width (GPIO13)
+	    float adc8_val = readKnob(KNOB8); // Detune (GPIO4)
 
-        // Diagnostic: Log raw ADC values periodically to check hardware response
-        if (xTaskGetTickCount() - last_adc_log_time >= pdMS_TO_TICKS(ADC_LOG_INTERVAL_MS)) {
-            ESP_LOGI(TAG, "ADC raw values: ADC1=%d, ADC6=%d, ADC5=%d, ADC7=%d, ADC8=%d",
-                     adc1_val, adc6_val, adc5_val, adc7_val, adc8_val);
+        // Diagnostic: Log normalized ADC values periodically
+        if (xTaskGetTickCount() - last_adc_log_time >= pdMS_TO_TICKS(500)) {
+            ESP_LOGI(TAG, "ADC raw values: ADC1=%.2f, adc8=%.2f, ADC3=%.2f, ADC5=%.2f, adc7=%.2f",
+                     adc1_val, adc8_val, adc3_val, adc5_val, adc7_val);
             last_adc_log_time = xTaskGetTickCount();
         }
 
         // Apply hysteresis and update only if changed significantly
         bool update_needed = false;
-        if (abs(adc1_val - last_adc1) > HYSTERESIS_THRESHOLD) { last_adc1 = adc1_val; update_needed = true; }
-        if (abs(adc6_val - last_adc6) > HYSTERESIS_THRESHOLD) { last_adc6 = adc6_val; update_needed = true; }  // Changed ADC3 to ADC6
-        if (abs(adc5_val - last_adc5) > HYSTERESIS_THRESHOLD) { last_adc5 = adc5_val; update_needed = true; }
-        if (abs(adc7_val - last_adc7) > HYSTERESIS_THRESHOLD) { last_adc7 = adc7_val; update_needed = true; }
-        if (abs(adc8_val - last_adc8) > HYSTERESIS_THRESHOLD) { last_adc8 = adc8_val; update_needed = true; }
+        static float last_adc1 = -1.0f, last_adc8 = -1.0f, last_adc3 = -1.0f, last_adc5 = -1.0f, last_adc7 = -1.0f;
+        if (fabs(adc1_val - last_adc1) > 0.01f) { last_adc1 = adc1_val; update_needed = true; }
+        if (fabs(adc3_val - last_adc3) > 0.01f) { last_adc3 = adc3_val; update_needed = true; }
+        if (fabs(adc5_val - last_adc5) > 0.01f) { last_adc5 = adc5_val; update_needed = true; }
+        if (fabs(adc7_val - last_adc7) > 0.01f) { last_adc7 = adc7_val; update_needed = true; }
+        if (fabs(adc8_val - last_adc8) > 0.01f) { last_adc8 = adc8_val; update_needed = true; }
 
-        if (update_needed && adc1_val != -1 && adc6_val != -1 && adc5_val != -1 && adc7_val != -1 && adc8_val != -1) {
+        if (update_needed && adc1_val >= 0.0f && adc8_val >= 0.0f && adc3_val >= 0.0f && adc5_val >= 0.0f && adc7_val >= 0.0f) {
             // Octave and fine tune (base for both oscillators)
-            int octave_step = adc1_val / 512;
-            octave_step = (octave_step > 7) ? 7 : ((octave_step < 0) ? 0 : octave_step);  // Added bounds
+            int octave_step = (int)(adc1_val * 8.0f);
+            octave_step = (octave_step > 7) ? 7 : ((octave_step < 0) ? 0 : octave_step);
             float base_freq[] = {130.81f, 261.63f, 523.25f, 1046.50f, 2093.00f, 4186.01f, 8372.02f, 16744.04f};
             float octave_base = base_freq[octave_step];
-            float fine_adj = 1.0f + (float)adc5_val / 4095.0f;
+            float fine_adj = 1.0f + adc5_val; // Fine tune on KNOB3
             float base_freq_val = octave_base * fine_adj;
 
-            // Balance (0.0 = all saw, 1.0 = all pulse) - update global, now from ADC6
-            float balance = (float)adc6_val / 4095.0f;
-            g_balance = balance;
+            // Balance (0.0 = all saw, 1.0 = all pulse) - update global
+            g_balance = adc3_val; // Balance on KNOB2
 
             // Pulse width (0.1 to 0.9)
-            float pw = MIN_PW + ((float)adc7_val / 4095.0f) * (MAX_PW - MIN_PW);
+            float pw = MIN_PW + (adc7_val * (MAX_PW - MIN_PW)); // Pulse width on KNOB5
             osc_pulse.SetPw(pw);
 
             // Detune (±2 semitones)
-            float detune_semi = ((float)adc8_val / 4095.0f - 0.5f) * (2.0f * MAX_DETUNE_SEMITONES);
+            float detune_semi = (adc8_val - 0.5f) * (2.0f * MAX_DETUNE_SEMITONES); // Detune on KNOB6
             float detune_mult = powf(2.0f, detune_semi / 12.0f);
             float freq_pulse = base_freq_val * detune_mult;
 
@@ -159,8 +158,8 @@ void updateOscTask(void *pvParameters) {
             osc_saw.SetFreq(base_freq_val);
             osc_pulse.SetFreq(freq_pulse);
 
-            ESP_LOGI(TAG, "Osc updated: Freq=%.2f Hz (saw), %.2f Hz (pulse), Bal=%.2f, PW=%.2f, Det=%.2f semi (ADCs:1=%d,6=%d,5=%d,7=%d,8=%d)",
-                     base_freq_val, freq_pulse, g_balance, pw, detune_semi, adc1_val, adc6_val, adc5_val, adc7_val, adc8_val);
+            ESP_LOGI(TAG, "Osc updated: Freq=%.2f Hz (saw), %.2f Hz (pulse), Bal=%.2f, PW=%.2f, Det=%.2f semi (ADCs:1=%.2f,3=%.2f,5=%.2f,7=%.2f,8=%.2f)",
+                     base_freq_val, freq_pulse, g_balance, pw, detune_semi, adc1_val, adc3_val, adc5_val, adc7_val, adc8_val);
         }
         vTaskDelay(pdMS_TO_TICKS(10));  // 10ms for smooth tracking
     }

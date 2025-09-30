@@ -139,3 +139,29 @@ These gestures integrate with the "patchSave" protocol for persistence: Connecti
 - **Debugging Connections**: Short press on a non-pending input requests flashing from its connected output, visually confirming routes in complex multi-slave setups (e.g., master oscillator modulating multiple slaves).
 
 This enhancement realizes the provisional's vision of storable, virtual CV, with extensible code (e.g., future double-press support via state machine in `pollButtons`). Total added LOC ~50; compatible with Eurorack scaling.
+
+ I am not using wifi for these modules, so don't worry about that conflict.  If I need to remove some wifi configuration I can do that, if it was added by mistake
+
+2) The latest version of the hardware (with the knobs and LEDs and so on) includes a jumper that can connect GPIO0 to Knob4.  I think you might be able to see this on the schematic I uploaded.
+
+3) I would therefore like all 8 knobs to be readable, though I would expect random noise on KNOB4 if the jumper is not connected, as that would leave GPIO0 floating
+
+4) The GPIO to Knob is as on the schematic:
+
+Knob    GPIO
+
+1                36
+
+2                35
+
+3               2
+
+4               0
+
+5               15
+
+6                14
+
+7                13
+
+8                4
