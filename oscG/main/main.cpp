@@ -48,6 +48,12 @@ void updateOscTask(void *pvParameters);
 #define MAX_DETUNE_SEMITONES 2.0f  // ±2 semitones
 #define ADC_LOG_INTERVAL_MS 500  // Diagnostic: Log raw ADC values every 500ms
 
+// Global structure definition for task parameters
+struct net_params {
+    uint32_t multicast_ip;
+    ip_addr_t local_addr;
+};
+
 daisysp::Oscillator osc_saw;  // Sawtooth oscillator
 daisysp::Oscillator osc_pulse;  // Pulse (variable square) oscillator
 
@@ -100,7 +106,9 @@ extern "C" void app_main(void) {
 
     uint8_t* ip_bytes = (uint8_t*)&unicast_ip;
     uint32_t multicast_ip = (239 << 24) | (100 << 16) | (ip_bytes[2] << 8) | ip_bytes[3];
-    printf("Multicast: %lu.%lu.%lu.%lu\n",
+	ip_addr_t local_addr;
+    ip_addr_set_ip4_u32(&local_addr, unicast_ip);
+    printf("Computed Multicast: %lu.%lu.%lu.%lu\n",
            (unsigned long)((multicast_ip >> 24) & 0xFF),
            (unsigned long)((multicast_ip >> 16) & 0xFF),
            (unsigned long)((multicast_ip >> 8) & 0xFF),
@@ -108,9 +116,10 @@ extern "C" void app_main(void) {
 
     BaseType_t core_id = 0;
     TaskHandle_t dummy_handle;
-
-    if (xTaskCreatePinnedToCore(sender_task, "sender_task", 4096, (void*)&multicast_ip, 2, NULL, core_id) != pdPASS ||
-        xTaskCreatePinnedToCore(receiver_task, "receiver_task", 4096, (void*)&multicast_ip, 2, NULL, core_id) != pdPASS ||
+	
+    struct net_params params = {multicast_ip, local_addr};
+    if (xTaskCreatePinnedToCore(sender_task, "sender_task", 4096, (void*)&params, 2, NULL, core_id) != pdPASS ||
+        xTaskCreatePinnedToCore(receiver_task, "receiver_task", 4096, (void*)&params, 2, NULL, core_id) != pdPASS ||
         xTaskCreatePinnedToCore(updateOscTask, "updateOsc", 4096, NULL, 3, &dummy_handle, core_id) != pdPASS ||
         xTaskCreatePinnedToCore(updateUITask, "updateUI", 2048, NULL, 5, NULL, 1) != pdPASS) {  // Pin to core 1
         ESP_LOGE(TAG, "Task creation failed - check memory");
@@ -176,81 +185,107 @@ void updateOscTask(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(20));  // 10ms for smooth tracking
     }
 }
+
 void sender_task(void* pvParameters) {
-    uint32_t multicast_ip = *(uint32_t*)pvParameters;
-	TNetConn xUdpConn = netconn_new ( NETCONN_UDP ); // could be NULL
-	
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0) {
-        printf("Sender: Socket creation failed: %s (errno %d)\n", strerror(errno), errno);
-        vTaskDelete(NULL);
-    }
-    printf("Sender: Socket created, handle: %d\n", sock);
+    struct net_params *params = (struct net_params *)pvParameters;
+    uint32_t multicast_ip = params->multicast_ip;
+    ip_addr_t local_addr = params->local_addr;
 
-    uint8_t ttl = 1;
-    if (setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl)) < 0) {
-        printf("Sender: IP_MULTICAST_TTL failed: %s (errno %d)\n", strerror(errno), errno);
-        close(sock);
+    struct netconn *conn = netconn_new(NETCONN_UDP);
+    if (conn == NULL) {
+        printf("Sender: Failed to create netconn: %s (errno %d)\n", strerror(errno), errno);
         vTaskDelete(NULL);
     }
 
-    struct sockaddr_in dest_addr;
-    memset(&dest_addr, 0, sizeof(dest_addr));
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(UDP_PORT);
-    dest_addr.sin_addr.s_addr = htonl(multicast_ip);
+    err_t err = netconn_bind(conn, &local_addr, 0);  // Bind to specific Ethernet IP, any port
+    if (err != ERR_OK) {
+        printf("Sender: Bind failed: %d (local IP: %s)\n", err, ip4addr_ntoa((ip4_addr_t*)&local_addr));
+        netconn_delete(conn);
+        vTaskDelete(NULL);
+    }
 
-    printf("Sender: Starting UDP oscillator test to %lu.%lu.%lu.%lu:%d\n",
+    // Attempt to join multicast group with IP_ADDR_ANY as interface
+    ip_addr_t any_addr;
+    ip_addr_copy(any_addr, *IP_ADDR_ANY);  // Initialize any_addr as IP_ADDR_ANY
+    ip_addr_t multi_addr;
+    ip_addr_set_ip4_u32(&multi_addr, htonl(multicast_ip));  // Ensure network byte order
+    printf("Sender: Joining multicast group (raw: 0x%08x, converted: %s, addr: 0x%08x)\n",
+           (unsigned int)multicast_ip, ip4addr_ntoa((ip4_addr_t*)&multi_addr), (unsigned int)multi_addr.u_addr.ip4.addr);
+    err = netconn_join_leave_group(conn, &multi_addr, &any_addr, NETCONN_JOIN);
+    if (err != ERR_OK) {
+        printf("Sender: Failed to join multicast group, err: %d\n", err);
+    } else {
+        printf("Sender: Successfully joined multicast group\n");
+    }
+
+    printf("Sender: Starting UDP oscillator test to %lu.%lu.%lu.%lu:%d, bound to %s\n",
            (unsigned long)((multicast_ip >> 24) & 0xFF),
            (unsigned long)((multicast_ip >> 16) & 0xFF),
            (unsigned long)((multicast_ip >> 8) & 0xFF),
-           (unsigned long)(multicast_ip & 0xFF), UDP_PORT);
+           (unsigned long)(multicast_ip & 0xFF), UDP_PORT,
+           ip4addr_ntoa((ip4_addr_t*)&local_addr));
 
     TickType_t last_wake_time = xTaskGetTickCount();
-	int packet_count = 0;
-	int64_t start_time = esp_timer_get_time();  // For throughput
-	int64_t total_bytes = 0;
-    // Static buffer for zero-copy optimization (allocated once, reused to avoid stack/heap churn)
-    static uint8_t buffer[PACKET_SIZE]__attribute__((aligned(4)));
+    int packet_count = 0;
+    int64_t start_time = esp_timer_get_time();  // For throughput
+    int64_t total_bytes = 0;
 
+    // Zero-copy buffer via netbuf
     while (1) {
-		int64_t loop_start = esp_timer_get_time();  // Latency start
+        struct netbuf *buf = netbuf_new();
+        if (buf == NULL) {
+            printf("Sender: netbuf_new failed\n");
+            vTaskDelay(1);
+            continue;
+        }
+
+        uint8_t *data = (uint8_t *)netbuf_alloc(buf, PACKET_SIZE);
+        if (data == NULL) {
+            printf("Sender: netbuf_alloc failed\n");
+            netbuf_delete(buf);
+            vTaskDelay(1);
+            continue;
+        }
+
+        int64_t loop_start = esp_timer_get_time();  // Latency start
         int offset = 0;
         for (int i = 0; i < BLOCK_SIZE; ++i) {
-		    float saw_sample = osc_saw.Process();
-		    float pulse_sample = osc_pulse.Process();
-		              // Mix based on shared global balance (updated by updateOscTask)
-		    float sample = (1.0f - g_balance) * saw_sample + g_balance * pulse_sample;
+            float saw_sample = osc_saw.Process();
+            float pulse_sample = osc_pulse.Process();
+            // Mix based on shared global balance (updated by updateOscTask)
+            float sample = (1.0f - g_balance) * saw_sample + g_balance * pulse_sample;
             int32_t value = static_cast<int32_t>(sample * 8388607.0f);
-            uint8_t tmp[3];
-            PACK_L24_BE(tmp, value);
-            buffer[offset++] = tmp[0];
-            buffer[offset++] = tmp[1];
-            buffer[offset++] = tmp[2];
+            PACK_L24_BE(&data[offset], value);  // Direct packing into netbuf
+            offset += 3;
         }
-        int sent = sendto(sock, buffer, PACKET_SIZE, 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
-		int64_t send_end = esp_timer_get_time();  // Latency end
 
-		        if (sent > 0 && (++packet_count % PRINT_INTERVAL == 0)) {
-		            total_bytes += sent;
-		            int64_t elapsed_us = send_end - start_time;
-		            float throughput_kbps = (total_bytes * 8.0f / 1024.0f) / (elapsed_us / 1000000.0f);
-		            printf("Sender: Sent %d bytes (packet #%d), Throughput=%.2f kbps, Latency=%.2f us\n",
-		                   sent, packet_count, throughput_kbps, (float)(send_end - loop_start));
-		            start_time = esp_timer_get_time();  // Reset for next interval
-		            total_bytes = 0;
-		        } else if (sent < 0) {
-		            printf("Sender: Send failed: %s (errno %d)\n", strerror(errno), errno);
-		        } else if (sent != PACKET_SIZE) {
-		            printf("Sender: Sent %d bytes, expected %d\n", sent, PACKET_SIZE);
-		        }
-        vTaskDelayUntil(&last_wake_time, 1);
+        err_t err = netconn_sendto(conn, buf, &multi_addr, UDP_PORT);  // Send to multicast addr
+        int64_t send_end = esp_timer_get_time();  // Latency end
+
+        if (err == ERR_OK) {
+            packet_count++;
+            total_bytes += PACKET_SIZE;
+            if (packet_count % PRINT_INTERVAL == 0) {
+                int64_t elapsed_us = send_end - start_time;
+                float throughput_kbps = (total_bytes * 8.0f / 1024.0f) / (elapsed_us / 1000000.0f);
+                printf("Sender: Sent %d bytes (packet #%d), Throughput=%.2f kbps, Latency=%.2f us\n",
+                       PACKET_SIZE, packet_count, throughput_kbps, (float)(send_end - loop_start));
+                start_time = esp_timer_get_time();  // Reset
+                total_bytes = 0;
+            }
+        } else {
+            printf("Sender: Sendto failed: %d\n", err);
+        }
+
+        netbuf_delete(buf);  // Free the netbuf
+        vTaskDelayUntil(&last_wake_time, 1);  // 1ms delay
     }
-    close(sock);
+
+    netconn_delete(conn);
     vTaskDelete(NULL);
 }
 
-void receiver_task(void* pvParameters) {
+void receiver_task(void* pvParameters) {while (1) vTaskDelay(pdMS_TO_TICKS(20));}/*
     uint32_t multicast_ip = *(uint32_t*)pvParameters;
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
@@ -310,4 +345,4 @@ void receiver_task(void* pvParameters) {
     }
     close(sock);
     vTaskDelete(NULL);
-}
+} */
