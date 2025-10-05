@@ -25,7 +25,11 @@ typedef enum { redGreenYellow, redGreen, redYellow, greenYellow, red, green, yel
 #define LONG_PRESS_THRESHOLD_US 1000000   // 1s
 #define KNOB_CHASE_THRESHOLD 0.05f  // 5% closeness
 
-typedef enum { KNOB1 = 0, KNOB2, KNOB3, KNOB4, KNOB5, KNOB6, KNOB7, KNOB8 } knob_index_t;  // Expanded to 8
+typedef enum { 
+    KNOB1 = 0, KNOB2, KNOB3, KNOB4, KNOB5, KNOB6, KNOB7, KNOB8, 
+    KNOB9 = 8, KNOB10, KNOB11, KNOB12, KNOB13, KNOB14, KNOB15, KNOB16 
+} knob_index_t;  // Expanded to 16 (8 physical + 8 virtual)
+#define NUM_KNOBS 16  // Total knob slots (physical + virtual)
 
 typedef enum {
     SHORT_PRESS,
@@ -67,13 +71,24 @@ void initUI(void);
  * @return Normalized value, or -1.0 on error.
  */
 float readKnob(knob_index_t knobNum);
+
 /**
  * @brief Set saved value for knob chasing (for patch recall).
- * @param knobNum Knob index.
+ * @param knobNum Knob index (physical or virtual).
  * @param value Normalized saved value (0.0-1.0).
  * @param enable_chase True to enable chasing mode.
+ * @param mode Mode (0: default, 1: btn-held).
  */
-void setKnobSavedValue(knob_index_t knobNum, float value, bool enable_chase);
+void setKnobSavedValue(knob_index_t knobNum, float value, bool enable_chase, uint8_t mode);
+
+/**
+ * @brief Initialize multi-mode knob with a button for a virtual knob.
+ * @param phys_knob Physical knob index.
+ * @param virt_knob Virtual knob index for button-held mode.
+ * @param btn Button to toggle virtual mode (0 if unused).
+ */
+void initMultiKnob(knob_index_t phys_knob, knob_index_t virt_knob, uint8_t btn);
+
 void shiftOutRegister(uint32_t bits_value);
 /**
  * @brief Simple LED state setter.
@@ -118,5 +133,4 @@ bool isButtonPressed(uint8_t btnNum);
 }
 #endif
 
-#define NUM_KNOBS 8  // Expanded to 8 (KNOB7/8 added)
 #endif // UI_H

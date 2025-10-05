@@ -11,6 +11,17 @@
 #include "freertos/task.h"
 #include "ui.h"
 
+#define NUM_KNOBS 16  // Expanded to 16 (8 physical + 8 virtual)
+#define KNOB_MODES 2  // Default, btn-held
+// Knob chasing globals per mode
+static float saved_knob_values[NUM_KNOBS][KNOB_MODES] = {{0.5f, 0.5f}};  // Default mid
+static bool is_chasing[NUM_KNOBS][KNOB_MODES] = {{false, false}};        // Chasing off
+static struct {
+    knob_index_t phys_knob;
+    knob_index_t virt_knob;
+    uint8_t btn;
+} multi_knob_map[NUM_KNOBS] = {{0}};  // Mapping: phys->virt, button
+
 #define PIN_MOSI GPIO_NUM_32
 #define PIN_CLK  GPIO_NUM_16
 #define PIN_SET_D GPIO_NUM_33
@@ -28,10 +39,6 @@ static bool longPressDetected[BUTTONSCOUNT] = {false};  // Flag for long press
 static uint16_t prev_button_state = 0;  // For reg change log
 static button_callback_t g_button_cb = NULL;  // Global cb
 
-// Knob chasing globals
-static float saved_knob_values[NUM_KNOBS] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};  // Default mid, normalized
-static bool is_chasing[NUM_KNOBS] = {false};
-
 volatile StateType LedState[LEDCOUNT] = {RESET};
 volatile bool LedBlinkState[LEDCOUNT] = {false};
 volatile uint32_t LedBlinkCount[LEDCOUNT] = {0};  // Cycles for blink timing
@@ -46,14 +53,17 @@ typedef struct {
 
 // ADC config for ESP32-WROOM, matching GPIO to channel (ADC1/2 assigned in initKnobs)
 static adc_config_t adc_configs[] = {
-    {GPIO_NUM_36, NULL, ADC_CHANNEL_0},  // KNOB1: GPIO36 = ADC1_CH0
-    {GPIO_NUM_35, NULL, ADC_CHANNEL_7},  // KNOB2: GPIO35 = ADC1_CH7
-    {GPIO_NUM_2,  NULL, ADC_CHANNEL_2},  // KNOB3: GPIO2 = ADC2_CH2
-    {GPIO_NUM_0,  NULL, ADC_CHANNEL_1},  // KNOB4: GPIO0 = ADC2_CH1 (jumpered; floating if not)
-    {GPIO_NUM_15, NULL, ADC_CHANNEL_3},  // KNOB5: GPIO15 = ADC2_CH3
-    {GPIO_NUM_14, NULL, ADC_CHANNEL_6},  // KNOB6: GPIO14 = ADC2_CH6
-    {GPIO_NUM_13, NULL, ADC_CHANNEL_4},  // KNOB7: GPIO13 = ADC2_CH4
-    {GPIO_NUM_4,  NULL, ADC_CHANNEL_0}   // KNOB8: GPIO4 = ADC2_CH0
+    {GPIO_NUM_36, NULL, ADC_CHANNEL_0},  // KNOB1: ADC1_CH0
+    {GPIO_NUM_35, NULL, ADC_CHANNEL_7},  // KNOB2: ADC1_CH7
+    {GPIO_NUM_2,  NULL, ADC_CHANNEL_2},  // KNOB3: ADC2_CH2
+    {GPIO_NUM_0,  NULL, ADC_CHANNEL_1},  // KNOB4: ADC2_CH1 (jumpered)
+    {GPIO_NUM_15, NULL, ADC_CHANNEL_3},  // KNOB5: ADC2_CH3
+    {GPIO_NUM_14, NULL, ADC_CHANNEL_6},  // KNOB6: ADC2_CH6
+    {GPIO_NUM_13, NULL, ADC_CHANNEL_4},  // KNOB7: ADC2_CH4
+    {GPIO_NUM_4,  NULL, ADC_CHANNEL_0},  // KNOB8: ADC2_CH0
+    // Virtual knobs (use physical knob's config)
+    {0, NULL, 0}, {0, NULL, 0}, {0, NULL, 0}, {0, NULL, 0},  // KNOB9-12
+    {0, NULL, 0}, {0, NULL, 0}, {0, NULL, 0}, {0, NULL, 0}   // KNOB13-16
 };
 
 static adc_oneshot_unit_handle_t adc1_handle;
@@ -203,68 +213,89 @@ void initUI(void) {
  * @param value Normalized saved value (0.0-1.0).
  * @param enable_chase True to enable chasing mode.
  */
-void setKnobSavedValue(knob_index_t knobNum, float value, bool enable_chase) {
+void setKnobSavedValue(knob_index_t knobNum, float value, bool enable_chase, uint8_t mode) {
     if (knobNum >= NUM_KNOBS) {
         ESP_LOGE(TAG, "Invalid knob %d", knobNum);
         return;
     }
-    if (value < 0.0f || value > 1.0f) {
-        ESP_LOGE(TAG, "Invalid value %.2f for knob %d", value, knobNum);
+    if (mode >= KNOB_MODES) {
+        ESP_LOGE(TAG, "Invalid mode %d for knob %d", mode, knobNum);
         return;
     }
-    saved_knob_values[knobNum] = value;
-    is_chasing[knobNum] = enable_chase;
-    ESP_LOGI(TAG, "Knob %d saved value set to %.2f, chasing %s", knobNum, value, enable_chase ? "enabled" : "disabled");
+    if (value < 0.0f || value > 1.0f) {
+        ESP_LOGE(TAG, "Invalid value %.2f for knob %d mode %d", value, knobNum, mode);
+        return;
+    }
+    saved_knob_values[knobNum][mode] = value;
+    is_chasing[knobNum][mode] = enable_chase;
+    ESP_LOGI(TAG, "Knob %d mode %d saved value set to %.2f, chasing %s", knobNum, mode, value, enable_chase ? "enabled" : "disabled");
 }
 
 float readKnob(knob_index_t knobNum) {
     if (knobNum >= NUM_KNOBS) {
-        ESP_LOGE(TAG, "Invalid knob %d", knobNum);
+        ESP_LOGE(TAG, "Invalid knob %d", knobNum + 1);  // +1 for user-friendly logs
         return -1.0f;
     }
 
-	int raw = 0;
-	adc_oneshot_unit_handle_t handle = adc_configs[knobNum].handle;
-	adc_channel_t channel = adc_configs[knobNum].channel;
-	esp_err_t err = adc_oneshot_read(handle, channel, &raw);
-	if (err != ESP_OK) {
-	    ESP_LOGE(TAG, "ADC read failed for knob %d: %s", knobNum, esp_err_to_name(err));
-	    return -1.0f;
-	}
+    // Resolve physical knob for virtual knobs
+    knob_index_t phys_knob = knobNum;
+    for (int i = 0; i < NUM_KNOBS; i++) {
+        if (multi_knob_map[i].virt_knob == knobNum) {
+            phys_knob = multi_knob_map[i].phys_knob;
+            break;
+        }
+    }
 
-	#define KNOB_LOG_THRESHOLD 100  // Threshold for logging significant changes
-	static int last_logged_raw[NUM_KNOBS] = {-1};  // Track last logged raw value
+    int raw = 0;
+    adc_oneshot_unit_handle_t handle = adc_configs[phys_knob].handle;
+    adc_channel_t channel = adc_configs[phys_knob].channel;
+    esp_err_t err = adc_oneshot_read(handle, channel, &raw);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ADC read failed for knob %d: %s", knobNum + 1, esp_err_to_name(err));
+        return -1.0f;
+    }
 
-	// Inverted per schematic with limited logging
-	static int last_raw[NUM_KNOBS] = {-1};
-	int inverted = 4095 - raw;
-	if (abs(inverted - last_raw[knobNum]) < HYSTERESIS_THRESHOLD && last_raw[knobNum] != -1) {
-	    inverted = last_raw[knobNum];
-	}
-	last_raw[knobNum] = inverted;
+    #define KNOB_LOG_THRESHOLD 100
+    static int last_logged_raw[NUM_KNOBS] = {-1};
 
-	float physical_norm = (float)inverted / 4095.0f;
+    static int last_raw[NUM_KNOBS] = {-1};
+    int inverted = 4095 - raw;
+    if (abs(inverted - last_raw[knobNum]) < HYSTERESIS_THRESHOLD && last_raw[knobNum] != -1) {
+        inverted = last_raw[knobNum];
+    }
+    last_raw[knobNum] = inverted;
 
-	// Chasing mode
-	if (is_chasing[knobNum]) {
-	    if (fabs(physical_norm - saved_knob_values[knobNum]) < KNOB_CHASE_THRESHOLD) {
-	        is_chasing[knobNum] = false;
-	        if (abs(raw - last_logged_raw[knobNum]) > KNOB_LOG_THRESHOLD || last_logged_raw[knobNum] == -1) {
-	            ESP_LOGI(TAG, "Knob %d caught up—switching to physical tracking, handle=%p, channel=%d, raw=%d",
-	                     knobNum, (void*)handle, channel, raw);
-	            last_logged_raw[knobNum] = raw;
-	        }
-	    }
-	    if (abs(raw - last_logged_raw[knobNum]) > KNOB_LOG_THRESHOLD || last_logged_raw[knobNum] == -1) {
-	        ESP_LOGI(TAG, "Knob %d handle=%p, channel=%d, raw=%d", knobNum, (void*)handle, channel, raw);  // Log all on change
-	        last_logged_raw[knobNum] = raw;
-	    }
-	} else if (abs(raw - last_logged_raw[knobNum]) > KNOB_LOG_THRESHOLD || last_logged_raw[knobNum] == -1) {
-	    ESP_LOGI(TAG, "Knob %d handle=%p, channel=%d, raw=%d", knobNum, (void*)handle, channel, raw);  // Log all on change
-	    last_logged_raw[knobNum] = raw;
-	}
+    float physical_norm = (float)inverted / 4095.0f;
 
-	return physical_norm;
+    // Check for virtual knob mapping and mode
+    uint8_t mode = 0;  // Default mode
+    for (int i = 0; i < NUM_KNOBS; i++) {
+        if (multi_knob_map[i].phys_knob == phys_knob && multi_knob_map[i].btn != 0 && isButtonPressed(multi_knob_map[i].btn)) {
+            mode = 1;  // Button-held mode
+            break;
+        }
+    }
+
+    if (is_chasing[knobNum][mode]) {
+        if (fabs(physical_norm - saved_knob_values[knobNum][mode]) < KNOB_CHASE_THRESHOLD) {
+            is_chasing[knobNum][mode] = false;
+            if (abs(raw - last_logged_raw[knobNum]) > KNOB_LOG_THRESHOLD || last_logged_raw[knobNum] == -1) {
+                ESP_LOGI(TAG, "Knob %d mode %d caught up—switching to physical tracking, handle=%p, channel=%d, raw=%d",
+                         knobNum + 1, mode, (void*)handle, channel, raw);
+                last_logged_raw[knobNum] = raw;
+            }
+        }
+        if (abs(raw - last_logged_raw[knobNum]) > KNOB_LOG_THRESHOLD || last_logged_raw[knobNum] == -1) {
+            ESP_LOGI(TAG, "Knob %d mode %d handle=%p, channel=%d, raw=%d", knobNum + 1, mode, (void*)handle, channel, raw);
+            last_logged_raw[knobNum] = raw;
+        }
+        return saved_knob_values[knobNum][mode];
+    } else if (abs(raw - last_logged_raw[knobNum]) > KNOB_LOG_THRESHOLD || last_logged_raw[knobNum] == -1) {
+        ESP_LOGI(TAG, "Knob %d mode %d handle=%p, channel=%d, raw=%d", knobNum + 1, mode, (void*)handle, channel, raw);
+        last_logged_raw[knobNum] = raw;
+    }
+
+    return physical_norm;
 }
 
 void shiftOutRegister(uint32_t bits_value) {
@@ -481,4 +512,24 @@ bool isButtonPressed(uint8_t btnNum) {
         return false;
     }
     return buttonCurrentStatus[btnNum - 1];
+}
+
+void initMultiKnob(knob_index_t phys_knob, knob_index_t virt_knob, uint8_t btn) {
+    if (phys_knob >= NUM_KNOBS || virt_knob >= NUM_KNOBS) {
+        ESP_LOGE(TAG, "Invalid knob %d or %d", phys_knob + 1, virt_knob + 1);
+        return;
+    }
+    if (btn != 0 && (btn < 1 || btn > BUTTONSCOUNT)) {
+        ESP_LOGE(TAG, "Invalid button %d", btn);
+        return;
+    }
+    for (int i = 0; i < NUM_KNOBS; i++) {
+        if (multi_knob_map[i].phys_knob == 0) {
+            multi_knob_map[i].phys_knob = phys_knob;
+            multi_knob_map[i].virt_knob = virt_knob;
+            multi_knob_map[i].btn = btn;
+            ESP_LOGI(TAG, "Multi-knob %d mapped to virtual %d with btn=%d", phys_knob + 1, virt_knob + 1, btn);
+            break;
+        }
+    }
 }

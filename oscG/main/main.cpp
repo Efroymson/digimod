@@ -1,7 +1,5 @@
-// main.cpp
 #include <stdio.h>
 #include <string.h>
-#include <cmath>  // For powf in detune calculation
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -16,22 +14,33 @@
 #include "daisysp.h"
 #include <stdint.h>
 #include "esp_log.h"
+#include "lwip/api.h"
 #include "ui.h"
 
 #define TAG "OSC"
 
 void sender_task(void* pvParameters);
 void receiver_task(void* pvParameters);
-void updateOscTask(void* pvParameters);
+void updateOscTask(void *pvParameters);
+
+#define TNetConn struct netconn *
+#define TNetBuf  struct netbuf  *
+
 
 #ifndef PACK_L24_BE
-#define PACK_L24_BE(p, v) do { (p)[0] = ((v) >> 16) & 0xFF; (p)[1] = ((v) >> 8) & 0xFF; (p)[2] = (v) & 0xFF; } while (0)
+#define PACK_L24_BE(p, v) do { \
+    (p)[0] = ((v) >> 16) & 0xFF; \
+    (p)[1] = ((v) >> 8) & 0xFF;  \
+    (p)[2] = (v) & 0xFF;         \
+} while (0)
 #endif
 
 #define SAMPLE_RATE 48000
 #define BLOCK_SIZE 96
 #define UDP_PORT 5005
 #define PACKET_SIZE (BLOCK_SIZE * 3)
+
+	
 #define PRINT_INTERVAL 5000
 #define HYSTERESIS_THRESHOLD 50  // From ui.h, for ADC stability
 #define MIN_PW 0.1f  // 10% duty cycle
@@ -53,6 +62,10 @@ void exampleButtonCb(uint8_t btn, PressType type) {
     ESP_LOGI(TAG, "Synth: Btn %d %s (e.g., route pot%d to osc freq via patchSave)", btn, type_str, btn);
     // Future: switch(btn) { case 1: if(type==SHORT_PRESS) set_virtual_route(POT_ADC3, OSC_FREQ); }
 }
+
+	
+
+
 
 extern "C" void app_main(void) {
     esp_err_t ret = nvs_flash_init();
@@ -105,7 +118,6 @@ extern "C" void app_main(void) {
         ESP_LOGI(TAG, "Tasks created and pinned to core %d", core_id);
     }
 }
-
 void updateOscTask(void *pvParameters) {
     ESP_LOGI(TAG, "OSC task started on core %d", xPortGetCoreID());
     TickType_t last_adc_log_time = xTaskGetTickCount();
@@ -161,12 +173,13 @@ void updateOscTask(void *pvParameters) {
             ESP_LOGI(TAG, "Osc updated: Freq=%.2f Hz (saw), %.2f Hz (pulse), Bal=%.2f, PW=%.2f, Det=%.2f semi (ADCs:1=%.2f,3=%.2f,5=%.2f,7=%.2f,8=%.2f)",
                      base_freq_val, freq_pulse, g_balance, pw, detune_semi, adc1_val, adc3_val, adc5_val, adc7_val, adc8_val);
         }
-        vTaskDelay(pdMS_TO_TICKS(10));  // 10ms for smooth tracking
+        vTaskDelay(pdMS_TO_TICKS(20));  // 10ms for smooth tracking
     }
 }
-
 void sender_task(void* pvParameters) {
     uint32_t multicast_ip = *(uint32_t*)pvParameters;
+	TNetConn xUdpConn = netconn_new ( NETCONN_UDP ); // could be NULL
+	
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
         printf("Sender: Socket creation failed: %s (errno %d)\n", strerror(errno), errno);
@@ -194,17 +207,21 @@ void sender_task(void* pvParameters) {
            (unsigned long)(multicast_ip & 0xFF), UDP_PORT);
 
     TickType_t last_wake_time = xTaskGetTickCount();
-    int packet_count = 0;
+	int packet_count = 0;
+	int64_t start_time = esp_timer_get_time();  // For throughput
+	int64_t total_bytes = 0;
+    // Static buffer for zero-copy optimization (allocated once, reused to avoid stack/heap churn)
+    static uint8_t buffer[PACKET_SIZE]__attribute__((aligned(4)));
 
     while (1) {
-        uint8_t buffer[PACKET_SIZE];
+		int64_t loop_start = esp_timer_get_time();  // Latency start
         int offset = 0;
         for (int i = 0; i < BLOCK_SIZE; ++i) {
-            float saw_sample = osc_saw.Process();
-            float pulse_sample = osc_pulse.Process();
-            // Mix based on shared global balance (updated by updateOscTask)
-            float sample = (1.0f - g_balance) * saw_sample + g_balance * pulse_sample;
-            int32_t value = static_cast<int32_t>(sample * 8388607.0f);  // 24-bit range
+		    float saw_sample = osc_saw.Process();
+		    float pulse_sample = osc_pulse.Process();
+		              // Mix based on shared global balance (updated by updateOscTask)
+		    float sample = (1.0f - g_balance) * saw_sample + g_balance * pulse_sample;
+            int32_t value = static_cast<int32_t>(sample * 8388607.0f);
             uint8_t tmp[3];
             PACK_L24_BE(tmp, value);
             buffer[offset++] = tmp[0];
@@ -212,14 +229,22 @@ void sender_task(void* pvParameters) {
             buffer[offset++] = tmp[2];
         }
         int sent = sendto(sock, buffer, PACKET_SIZE, 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
-        if (sent > 0 && (++packet_count % PRINT_INTERVAL == 0)) {
-            printf("Sender: Sent %d bytes (packet #%d)\n", sent, packet_count);
-        } else if (sent < 0) {
-            printf("Sender: Send failed: %s (errno %d)\n", strerror(errno), errno);
-        } else if (sent != PACKET_SIZE) {
-            printf("Sender: Sent %d bytes, expected %d\n", sent, PACKET_SIZE);
-        }
-        vTaskDelayUntil(&last_wake_time, 1);  // 1ms delay
+		int64_t send_end = esp_timer_get_time();  // Latency end
+
+		        if (sent > 0 && (++packet_count % PRINT_INTERVAL == 0)) {
+		            total_bytes += sent;
+		            int64_t elapsed_us = send_end - start_time;
+		            float throughput_kbps = (total_bytes * 8.0f / 1024.0f) / (elapsed_us / 1000000.0f);
+		            printf("Sender: Sent %d bytes (packet #%d), Throughput=%.2f kbps, Latency=%.2f us\n",
+		                   sent, packet_count, throughput_kbps, (float)(send_end - loop_start));
+		            start_time = esp_timer_get_time();  // Reset for next interval
+		            total_bytes = 0;
+		        } else if (sent < 0) {
+		            printf("Sender: Send failed: %s (errno %d)\n", strerror(errno), errno);
+		        } else if (sent != PACKET_SIZE) {
+		            printf("Sender: Sent %d bytes, expected %d\n", sent, PACKET_SIZE);
+		        }
+        vTaskDelayUntil(&last_wake_time, 1);
     }
     close(sock);
     vTaskDelete(NULL);
@@ -267,7 +292,8 @@ void receiver_task(void* pvParameters) {
                (unsigned long)(multicast_ip & 0xFF));
     }
 
-    uint8_t buffer[PACKET_SIZE];
+    // Static buffer for zero-copy optimization (allocated once, reused to avoid stack/heap churn)
+    static uint8_t buffer[PACKET_SIZE];
     struct sockaddr_in source_addr;
     socklen_t addr_len = sizeof(source_addr);
 
