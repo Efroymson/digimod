@@ -21,11 +21,9 @@
 
 void sender_task(void* pvParameters);
 void receiver_task(void* pvParameters);
-void updateOscTask(void *pvParameters);
 
 #define TNetConn struct netconn *
 #define TNetBuf  struct netbuf  *
-
 
 #ifndef PACK_L24_BE
 #define PACK_L24_BE(p, v) do { \
@@ -40,13 +38,15 @@ void updateOscTask(void *pvParameters);
 #define UDP_PORT 5005
 #define PACKET_SIZE (BLOCK_SIZE * 3)
 
-	
 #define PRINT_INTERVAL 5000
-#define HYSTERESIS_THRESHOLD 50  // From ui.h, for ADC stability
+
 #define MIN_PW 0.1f  // 10% duty cycle
 #define MAX_PW 0.9f  // 90% duty cycle
-#define MAX_DETUNE_SEMITONES 2.0f  // ±2 semitones
-#define ADC_LOG_INTERVAL_MS 500  // Diagnostic: Log raw ADC values every 500ms
+#define MAX_DETUNE_SEMITONES 2.0f  // ±2 semitones (conservative for beats)
+#define MAX_FINE_SEMITONES 12.0f   // Full octave for fine tune (enhanced range)
+
+#define MAX_DETUNE_SEMITONES 2.0f  // ±2 semitones (conservative for beats)
+#define MAX_FINE_SEMITONES 12.0f   // Full octave for fine tune (enhanced range)
 
 // Global structure definition for task parameters
 struct net_params {
@@ -57,8 +57,17 @@ struct net_params {
 daisysp::Oscillator osc_saw;  // Sawtooth oscillator
 daisysp::Oscillator osc_pulse;  // Pulse (variable square) oscillator
 
-// Global shared state for balance (volatile for thread-safety in multi-task environment)
-volatile float g_balance = 0.5f;  // Default to centered mix (50/50 saw/pulse)
+// Global shared state for raw knob values (updated by UI task)
+volatile float knob_octave = 0.5f;     // KNOB1: Octave
+volatile float knob_balance = 0.5f;    // KNOB3: Balance
+volatile float knob_fine_tune = 0.5f;  // KNOB5: Fine tune
+volatile float knob_pw = 0.5f;         // KNOB7: Pulse width
+volatile float knob_detune = 0.5f;     // KNOB8: Detune
+
+// Derived params (computed in sender_task)
+float g_freq = 440.0f;
+float g_detune_offset = 0.0f;
+float g_fine_offset = 0.0f;
 
 // Global for task
 button_callback_t g_button_cb = NULL;
@@ -68,10 +77,6 @@ void exampleButtonCb(uint8_t btn, PressType type) {
     ESP_LOGI(TAG, "Synth: Btn %d %s (e.g., route pot%d to osc freq via patchSave)", btn, type_str, btn);
     // Future: switch(btn) { case 1: if(type==SHORT_PRESS) set_virtual_route(POT_ADC3, OSC_FREQ); }
 }
-
-	
-
-
 
 extern "C" void app_main(void) {
     esp_err_t ret = nvs_flash_init();
@@ -87,10 +92,13 @@ extern "C" void app_main(void) {
     ESP_ERROR_CHECK(net_connect());
 
     initUI();
-    setUILogLevel(ESP_LOG_INFO);
-    //shiftOutRegister(ox0);
+    setUILogLevel(ESP_LOG_DEBUG);  // Enable debug for testing
     setButtonCallback(exampleButtonCb);
-    //testUI();  // use only for testing board
+    setKnobParam(KNOB1, &knob_octave);     // Register pointers
+    setKnobParam(KNOB3, &knob_balance);
+    setKnobParam(KNOB5, &knob_fine_tune);
+    setKnobParam(KNOB7, &knob_pw);
+    setKnobParam(KNOB8, &knob_detune);
 
     // Initialize oscillators
     osc_saw.Init(SAMPLE_RATE);
@@ -106,7 +114,7 @@ extern "C" void app_main(void) {
 
     uint8_t* ip_bytes = (uint8_t*)&unicast_ip;
     uint32_t multicast_ip = (239 << 24) | (100 << 16) | (ip_bytes[2] << 8) | ip_bytes[3];
-	ip_addr_t local_addr;
+    ip_addr_t local_addr;
     ip_addr_set_ip4_u32(&local_addr, unicast_ip);
     printf("Computed Multicast: %lu.%lu.%lu.%lu\n",
            (unsigned long)((multicast_ip >> 24) & 0xFF),
@@ -115,74 +123,14 @@ extern "C" void app_main(void) {
            (unsigned long)(multicast_ip & 0xFF));
 
     BaseType_t core_id = 0;
-    TaskHandle_t dummy_handle;
-	
+
     struct net_params params = {multicast_ip, local_addr};
     if (xTaskCreatePinnedToCore(sender_task, "sender_task", 4096, (void*)&params, 2, NULL, core_id) != pdPASS ||
         xTaskCreatePinnedToCore(receiver_task, "receiver_task", 4096, (void*)&params, 2, NULL, core_id) != pdPASS ||
-        xTaskCreatePinnedToCore(updateOscTask, "updateOsc", 4096, NULL, 3, &dummy_handle, core_id) != pdPASS ||
         xTaskCreatePinnedToCore(updateUITask, "updateUI", 2048, NULL, 5, NULL, 1) != pdPASS) {  // Pin to core 1
         ESP_LOGE(TAG, "Task creation failed - check memory");
     } else {
         ESP_LOGI(TAG, "Tasks created and pinned to core %d", core_id);
-    }
-}
-void updateOscTask(void *pvParameters) {
-    ESP_LOGI(TAG, "OSC task started on core %d", xPortGetCoreID());
-    TickType_t last_adc_log_time = xTaskGetTickCount();
-
-    while (1) {
-		float adc1_val = readKnob(KNOB1); // Octave (GPIO36)
-		float adc3_val = readKnob(KNOB3); // Balance (GPIO2)
-		float adc5_val = readKnob(KNOB5); // Fine tune (GPIO15)
-		float adc7_val = readKnob(KNOB7); // Pulse width (GPIO13)
-	    float adc8_val = readKnob(KNOB8); // Detune (GPIO4)
-
-        // Diagnostic: Log normalized ADC values periodically
-        if (xTaskGetTickCount() - last_adc_log_time >= pdMS_TO_TICKS(500)) {
-            ESP_LOGI(TAG, "ADC raw values: ADC1=%.2f, adc8=%.2f, ADC3=%.2f, ADC5=%.2f, adc7=%.2f",
-                     adc1_val, adc8_val, adc3_val, adc5_val, adc7_val);
-            last_adc_log_time = xTaskGetTickCount();
-        }
-
-        // Apply hysteresis and update only if changed significantly
-        bool update_needed = false;
-        static float last_adc1 = -1.0f, last_adc8 = -1.0f, last_adc3 = -1.0f, last_adc5 = -1.0f, last_adc7 = -1.0f;
-        if (fabs(adc1_val - last_adc1) > 0.01f) { last_adc1 = adc1_val; update_needed = true; }
-        if (fabs(adc3_val - last_adc3) > 0.01f) { last_adc3 = adc3_val; update_needed = true; }
-        if (fabs(adc5_val - last_adc5) > 0.01f) { last_adc5 = adc5_val; update_needed = true; }
-        if (fabs(adc7_val - last_adc7) > 0.01f) { last_adc7 = adc7_val; update_needed = true; }
-        if (fabs(adc8_val - last_adc8) > 0.01f) { last_adc8 = adc8_val; update_needed = true; }
-
-        if (update_needed && adc1_val >= 0.0f && adc8_val >= 0.0f && adc3_val >= 0.0f && adc5_val >= 0.0f && adc7_val >= 0.0f) {
-            // Octave and fine tune (base for both oscillators)
-            int octave_step = (int)(adc1_val * 8.0f);
-            octave_step = (octave_step > 7) ? 7 : ((octave_step < 0) ? 0 : octave_step);
-            float base_freq[] = {130.81f, 261.63f, 523.25f, 1046.50f, 2093.00f, 4186.01f, 8372.02f, 16744.04f};
-            float octave_base = base_freq[octave_step];
-            float fine_adj = 1.0f + adc5_val; // Fine tune on KNOB3
-            float base_freq_val = octave_base * fine_adj;
-
-            // Balance (0.0 = all saw, 1.0 = all pulse) - update global
-            g_balance = adc3_val; // Balance on KNOB2
-
-            // Pulse width (0.1 to 0.9)
-            float pw = MIN_PW + (adc7_val * (MAX_PW - MIN_PW)); // Pulse width on KNOB5
-            osc_pulse.SetPw(pw);
-
-            // Detune (±2 semitones)
-            float detune_semi = (adc8_val - 0.5f) * (2.0f * MAX_DETUNE_SEMITONES); // Detune on KNOB6
-            float detune_mult = powf(2.0f, detune_semi / 12.0f);
-            float freq_pulse = base_freq_val * detune_mult;
-
-            // Set frequencies
-            osc_saw.SetFreq(base_freq_val);
-            osc_pulse.SetFreq(freq_pulse);
-
-            ESP_LOGI(TAG, "Osc updated: Freq=%.2f Hz (saw), %.2f Hz (pulse), Bal=%.2f, PW=%.2f, Det=%.2f semi (ADCs:1=%.2f,3=%.2f,5=%.2f,7=%.2f,8=%.2f)",
-                     base_freq_val, freq_pulse, g_balance, pw, detune_semi, adc1_val, adc3_val, adc5_val, adc7_val, adc8_val);
-        }
-        vTaskDelay(pdMS_TO_TICKS(20));  // 10ms for smooth tracking
     }
 }
 
@@ -190,25 +138,22 @@ void sender_task(void* pvParameters) {
     struct net_params *params = (struct net_params *)pvParameters;
     uint32_t multicast_ip = params->multicast_ip;
     ip_addr_t local_addr = params->local_addr;
-
     struct netconn *conn = netconn_new(NETCONN_UDP);
     if (conn == NULL) {
         printf("Sender: Failed to create netconn: %s (errno %d)\n", strerror(errno), errno);
         vTaskDelete(NULL);
     }
-
-    err_t err = netconn_bind(conn, &local_addr, 0);  // Bind to specific Ethernet IP, any port
+    err_t err = netconn_bind(conn, &local_addr, 0); // Bind to specific Ethernet IP, any port
     if (err != ERR_OK) {
         printf("Sender: Bind failed: %d (local IP: %s)\n", err, ip4addr_ntoa((ip4_addr_t*)&local_addr));
         netconn_delete(conn);
         vTaskDelete(NULL);
     }
-
     // Attempt to join multicast group with IP_ADDR_ANY as interface
     ip_addr_t any_addr;
-    ip_addr_copy(any_addr, *IP_ADDR_ANY);  // Initialize any_addr as IP_ADDR_ANY
+    ip_addr_copy(any_addr, *IP_ADDR_ANY); // Initialize any_addr as IP_ADDR_ANY
     ip_addr_t multi_addr;
-    ip_addr_set_ip4_u32(&multi_addr, htonl(multicast_ip));  // Ensure network byte order
+    ip_addr_set_ip4_u32(&multi_addr, htonl(multicast_ip)); // Ensure network byte order
     printf("Sender: Joining multicast group (raw: 0x%08x, converted: %s, addr: 0x%08x)\n",
            (unsigned int)multicast_ip, ip4addr_ntoa((ip4_addr_t*)&multi_addr), (unsigned int)multi_addr.u_addr.ip4.addr);
     err = netconn_join_leave_group(conn, &multi_addr, &any_addr, NETCONN_JOIN);
@@ -230,8 +175,26 @@ void sender_task(void* pvParameters) {
     int64_t start_time = esp_timer_get_time();  // For throughput
     int64_t total_bytes = 0;
 
-    // Zero-copy buffer via netbuf
+    // Octave base frequencies (C3 to C8)
+    float base_freq[] = {130.81f, 261.63f, 523.25f, 1046.50f, 2093.00f, 4186.01f, 8372.02f, 16744.04f};
+
     while (1) {
+        if (knobsUpdated) {
+            // Compute derived params
+            int octave_step = (int)(knob_octave * 8.0f);
+            octave_step = (octave_step > 7) ? 7 : ((octave_step < 0) ? 0 : octave_step);
+            float octave_base = base_freq[octave_step];
+            float fine_adj = powf(2.0f, (knob_fine_tune - 0.5f) * MAX_FINE_SEMITONES / 12.0f);  // Enhanced: ±12 semitones as ratio
+            g_freq = octave_base * fine_adj;
+            g_detune_offset = (knob_detune - 0.5f) * MAX_DETUNE_SEMITONES / 12.0f;  // ±2 semitones as ratio
+            osc_saw.SetFreq(g_freq * powf(2.0f, g_detune_offset));
+            osc_pulse.SetFreq(g_freq);  // Apply base to pulse
+            osc_pulse.SetPw(MIN_PW + knob_pw * (MAX_PW - MIN_PW));
+            knobsUpdated = 0;
+            ESP_LOGI(TAG, "Sender: Knobs updated, recomputed (freq=%.2f, balance=%.2f, pw=%.2f, detune=%.2f, oct=%.2f, fine=%.2f)",
+                     g_freq, knob_balance, knob_pw, g_detune_offset, knob_octave, knob_fine_tune);
+        }
+
         struct netbuf *buf = netbuf_new();
         if (buf == NULL) {
             printf("Sender: netbuf_new failed\n");
@@ -252,8 +215,8 @@ void sender_task(void* pvParameters) {
         for (int i = 0; i < BLOCK_SIZE; ++i) {
             float saw_sample = osc_saw.Process();
             float pulse_sample = osc_pulse.Process();
-            // Mix based on shared global balance (updated by updateOscTask)
-            float sample = (1.0f - g_balance) * saw_sample + g_balance * pulse_sample;
+            // Mix based on balance
+            float sample = (1.0f - knob_balance) * saw_sample + knob_balance * pulse_sample;
             int32_t value = static_cast<int32_t>(sample * 8388607.0f);
             PACK_L24_BE(&data[offset], value);  // Direct packing into netbuf
             offset += 3;
@@ -285,64 +248,6 @@ void sender_task(void* pvParameters) {
     vTaskDelete(NULL);
 }
 
-void receiver_task(void* pvParameters) {while (1) vTaskDelay(pdMS_TO_TICKS(20));}/*
-    uint32_t multicast_ip = *(uint32_t*)pvParameters;
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0) {
-        printf("Receiver: Socket creation failed: %s (errno %d)\n", strerror(errno), errno);
-        vTaskDelete(NULL);
-    }
-    printf("Receiver: Socket created, handle: %d\n", sock);
-
-    int on = 1;
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
-        printf("Receiver: SO_REUSEADDR failed: %s (errno %d)\n", strerror(errno), errno);
-        close(sock);
-        vTaskDelete(NULL);
-    }
-
-    struct sockaddr_in bind_addr;
-    memset(&bind_addr, 0, sizeof(bind_addr));
-    bind_addr.sin_family = AF_INET;
-    bind_addr.sin_port = htons(UDP_PORT);
-    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(sock, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
-        printf("Receiver: Bind failed: %s (errno %d)\n", strerror(errno), errno);
-        close(sock);
-        vTaskDelete(NULL);
-    }
-
-    struct ip_mreq mreq;
-    mreq.imr_multiaddr.s_addr = htonl(multicast_ip);
-    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-    if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-        printf("Receiver: IP_ADD_MEMBERSHIP failed: %s (errno %d)\n", strerror(errno), errno);
-        close(sock);
-        vTaskDelete(NULL);
-    } else {
-        printf("Receiver: Joined multicast group %lu.%lu.%lu.%lu\n",
-               (unsigned long)((multicast_ip >> 24) & 0xFF),
-               (unsigned long)((multicast_ip >> 16) & 0xFF),
-               (unsigned long)((multicast_ip >> 8) & 0xFF),
-               (unsigned long)(multicast_ip & 0xFF));
-    }
-
-    // Static buffer for zero-copy optimization (allocated once, reused to avoid stack/heap churn)
-    static uint8_t buffer[PACKET_SIZE];
-    struct sockaddr_in source_addr;
-    socklen_t addr_len = sizeof(source_addr);
-
-    while (1) {
-        int len = recvfrom(sock, buffer, PACKET_SIZE, 0, (struct sockaddr*)&source_addr, &addr_len);
-        if (len > 0) {
-            char ip_str[16];
-            inet_ntop(AF_INET, &source_addr.sin_addr, ip_str, sizeof(ip_str));
-            printf("Receiver: Received %d bytes from %s:%d\n", len, ip_str, ntohs(source_addr.sin_port));
-        } else if (len < 0) {
-            printf("Receiver: Recv failed: %s (errno %d)\n", strerror(errno), errno);
-        }
-        vTaskDelay(1 / portTICK_PERIOD_MS);
-    }
-    close(sock);
-    vTaskDelete(NULL);
-} */
+void receiver_task(void* pvParameters) {
+    while (1) vTaskDelay(pdMS_TO_TICKS(20));
+}

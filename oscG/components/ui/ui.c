@@ -15,7 +15,8 @@
 #define KNOB_MODES 2  // Default, btn-held
 // Knob chasing globals per mode
 static float saved_knob_values[NUM_KNOBS][KNOB_MODES] = {{0.5f, 0.5f}};  // Default mid
-static bool is_chasing[NUM_KNOBS][KNOB_MODES] = {{false, false}};        // Chasing off
+static bool isChasing[NUM_KNOBS][KNOB_MODES] = {{false, false}};        // Explicit chasing control
+
 static struct {
     knob_index_t phys_knob;
     knob_index_t virt_knob;
@@ -29,6 +30,8 @@ static struct {
 #define PIN_QH   GPIO_NUM_5  // Schematic: Input for Q7 (serial out, high=pressed)
 
 static const char *TAG = "UI";
+
+volatile uint8_t knobsUpdated = 0;  // Global flag for knob changes
 
 // Button globals (simplified, no double-click)
 static bool buttonCurrentStatus[BUTTONSCOUNT] = {false};
@@ -69,10 +72,9 @@ static adc_config_t adc_configs[] = {
 static adc_oneshot_unit_handle_t adc1_handle;
 static adc_oneshot_unit_handle_t adc2_handle;
 
-/**
- * @brief Exact chetu readShiftRegister (high QH = pressed = set bit).
- * @return State mask (LSB = btn1).
- */
+// Per-knob param pointers (NULL if not registered)
+static volatile float* knob_params[NUM_KNOBS] = {NULL};
+
 static uint16_t readButtonRegister(void) {
     gpio_set_level(PIN_SHLD, 0);
     gpio_set_level(PIN_CLK, 0);
@@ -89,9 +91,6 @@ static uint16_t readButtonRegister(void) {
     return switch_value;
 }
 
-/**
- * @brief Chetu-style GetButtonsStatus: Read reg, detect edges, fire cb (no double-click).
- */
 static void pollButtons(void) {
     if (!g_button_cb) {
         ESP_LOGW(TAG, "No button cb set");  // One-time
@@ -180,217 +179,125 @@ static void initKnobs(void) {
     };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&adc2_cfg, &adc2_handle));
 
-	for (int i = 0; i < NUM_KNOBS; i++) {
-	    ESP_LOGI(TAG, "ADC%d init for GPIO%d", i+1, adc_configs[i].gpio);  // Debug init
-	    adc_oneshot_chan_cfg_t chan_cfg = {
-	        .atten = ADC_ATTEN_DB_12,  // Updated from deprecated DB_11
-	        .bitwidth = ADC_BITWIDTH_12,
-	    };
-	    if (adc_configs[i].gpio >= 32 && adc_configs[i].gpio <= 39) {  // ADC1 pins
-	        adc_configs[i].handle = adc1_handle;
-	        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, adc_configs[i].channel, &chan_cfg));
-	    } else {  // ADC2 pins
-	        adc_configs[i].handle = adc2_handle;
-	        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, adc_configs[i].channel, &chan_cfg));
-	    }
-	}
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten = ADC_ATTEN_DB_12,  // Updated for deprecation
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    for (int i = 0; i < NUM_KNOBS; i++) {
+        if (adc_configs[i].gpio == 0) continue;  // Skip virtual if not configured
+        adc_configs[i].handle = (i < 2) ? adc1_handle : adc2_handle;  // Fixed: KNOB1/2 on ADC1, KNOB3+ on ADC2
+        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_configs[i].handle, adc_configs[i].channel, &chan_cfg));
+    }
+    // Initial read to set baseline for registered knobs
+    for (int i = 0; i < NUM_KNOBS; i++) {
+        if (knob_params[i]) {
+            float init_val = readKnob(i);
+            ESP_LOGI(TAG, "Initial read for knob %d: %.2f", i, init_val);
+        }
+    }
 }
 
 void initUI(void) {
     initButtons();
     initLEDs();
     initKnobs();
-    memset((void*)LedState, RESET, sizeof(LedState));  // Cast to avoid volatile warning
-    memset((void*)LedBlinkState, false, sizeof(LedBlinkState));  // Cast to avoid volatile warning
-    memset((void*)LedBlinkCount, 0, sizeof(LedBlinkCount));  // Cast to avoid volatile warning
-    memset((void*)LedBlinkSpeed, slow, sizeof(LedBlinkSpeed));  // Cast to avoid volatile warning
-    lastBlinkTime = 0;
-}
-
-/**
- * @brief Set saved value for knob chasing (for patch recall).
- * @param knobNum Knob index.
- * @param value Normalized saved value (0.0-1.0).
- * @param enable_chase True to enable chasing mode.
- */
-void setKnobSavedValue(knob_index_t knobNum, float value, bool enable_chase, uint8_t mode) {
-    if (knobNum >= NUM_KNOBS) {
-        ESP_LOGE(TAG, "Invalid knob %d", knobNum);
-        return;
-    }
-    if (mode >= KNOB_MODES) {
-        ESP_LOGE(TAG, "Invalid mode %d for knob %d", mode, knobNum);
-        return;
-    }
-    if (value < 0.0f || value > 1.0f) {
-        ESP_LOGE(TAG, "Invalid value %.2f for knob %d mode %d", value, knobNum, mode);
-        return;
-    }
-    saved_knob_values[knobNum][mode] = value;
-    is_chasing[knobNum][mode] = enable_chase;
-    ESP_LOGI(TAG, "Knob %d mode %d saved value set to %.2f, chasing %s", knobNum, mode, value, enable_chase ? "enabled" : "disabled");
 }
 
 float readKnob(knob_index_t knobNum) {
     if (knobNum >= NUM_KNOBS) {
-        ESP_LOGE(TAG, "Invalid knob %d", knobNum + 1);  // +1 for user-friendly logs
+        ESP_LOGE(TAG, "Invalid knob %d", knobNum);
         return -1.0f;
     }
 
-    // Resolve physical knob for virtual knobs
-    knob_index_t phys_knob = knobNum;
+    int raw;
+    if (adc_oneshot_read(adc_configs[knobNum].handle, adc_configs[knobNum].channel, &raw) != ESP_OK) {
+        ESP_LOGE(TAG, "ADC read failed for knob %d", knobNum);
+        return -1.0f;
+    }
+    ESP_LOGD(TAG, "Knob %d raw ADC: %d", knobNum, raw);  // LOGD to reduce spam
+
+    float norm = (4095.0f - (float)raw) / 4095.0f;  // Inverted, normalized 0-1
+    uint8_t mode = 0;
     for (int i = 0; i < NUM_KNOBS; i++) {
-        if (multi_knob_map[i].virt_knob == knobNum) {
-            phys_knob = multi_knob_map[i].phys_knob;
+        if (multi_knob_map[i].phys_knob == knobNum && multi_knob_map[i].btn != 0 && isButtonPressed(multi_knob_map[i].btn)) {
+            mode = 1;
+            knobNum = multi_knob_map[i].virt_knob;
             break;
         }
     }
 
-    int raw = 0;
-    adc_oneshot_unit_handle_t handle = adc_configs[phys_knob].handle;
-    adc_channel_t channel = adc_configs[phys_knob].channel;
-    esp_err_t err = adc_oneshot_read(handle, channel, &raw);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "ADC read failed for knob %d: %s", knobNum + 1, esp_err_to_name(err));
-        return -1.0f;
+    if (isChasing[knobNum][mode]) {
+        float saved = saved_knob_values[knobNum][mode];
+        float diff = fabs(norm - saved);
+        if (diff > KNOB_CHASE_THRESHOLD) {
+            ESP_LOGD(TAG, "Chasing knob %d (mode %d): diff %.2f > threshold, holding %.2f", knobNum, mode, diff, saved);
+            return saved;
+        } else {
+            float averaged = (saved + norm) / 2.0f;
+            saved_knob_values[knobNum][mode] = averaged;
+            isChasing[knobNum][mode] = false;
+            ESP_LOGI(TAG, "Chasing knob %d (mode %d): picked up, averaged to %.2f", knobNum, mode, averaged);
+            return averaged;
+        }
     }
+    return norm;
+}
 
-    #define KNOB_LOG_THRESHOLD 100
-    static int last_logged_raw[NUM_KNOBS] = {-1};
-
-    static int last_raw[NUM_KNOBS] = {-1};
-    int inverted = 4095 - raw;
-    if (abs(inverted - last_raw[knobNum]) < HYSTERESIS_THRESHOLD && last_raw[knobNum] != -1) {
-        inverted = last_raw[knobNum];
+void setKnobSavedValue(knob_index_t knobNum, float value, uint8_t mode, bool enable_chase) {
+    if (knobNum >= NUM_KNOBS || mode >= KNOB_MODES) {
+        ESP_LOGE(TAG, "Invalid knob %d or mode %d", knobNum, mode);
+        return;
     }
-    last_raw[knobNum] = inverted;
-
-    float physical_norm = (float)inverted / 4095.0f;
-
-    // Check for virtual knob mapping and mode
-    uint8_t mode = 0;  // Default mode
+    saved_knob_values[knobNum][mode] = (value >= 0.0f && value <= 1.0f) ? value : 0.5f;
+    isChasing[knobNum][mode] = enable_chase;
+    // Sync chasing for virtual pairs (phys/virt)
     for (int i = 0; i < NUM_KNOBS; i++) {
-        if (multi_knob_map[i].phys_knob == phys_knob && multi_knob_map[i].btn != 0 && isButtonPressed(multi_knob_map[i].btn)) {
-            mode = 1;  // Button-held mode
+        if (multi_knob_map[i].phys_knob == knobNum) {
+            isChasing[multi_knob_map[i].virt_knob][mode] = enable_chase;
+        } else if (multi_knob_map[i].virt_knob == knobNum) {
+            isChasing[multi_knob_map[i].phys_knob][mode] = enable_chase;
+        }
+    }
+    ESP_LOGI(TAG, "Knob %d (mode %d) saved: %.2f, chasing %s", knobNum, mode, saved_knob_values[knobNum][mode], enable_chase ? "enabled" : "disabled");
+}
+
+void setKnobParam(knob_index_t knobNum, volatile float* paramPtr) {
+    if (knobNum >= NUM_KNOBS) {
+        ESP_LOGE(TAG, "Invalid knob %d", knobNum);
+        return;
+    }
+    knob_params[knobNum] = paramPtr;
+    ESP_LOGI(TAG, "Param pointer registered for knob %d at %p", knobNum, (void*)paramPtr);
+}
+
+void initMultiKnob(knob_index_t phys_knob, knob_index_t virt_knob, uint8_t btn) {
+    if (phys_knob >= NUM_KNOBS || virt_knob >= NUM_KNOBS) {
+        ESP_LOGE(TAG, "Invalid knob %d or %d", phys_knob + 1, virt_knob + 1);
+        return;
+    }
+    if (btn != 0 && (btn < 1 || btn > BUTTONSCOUNT)) {
+        ESP_LOGE(TAG, "Invalid button %d", btn);
+        return;
+    }
+    for (int i = 0; i < NUM_KNOBS; i++) {
+        if (multi_knob_map[i].phys_knob == 0) {
+            multi_knob_map[i].phys_knob = phys_knob;
+            multi_knob_map[i].virt_knob = virt_knob;
+            multi_knob_map[i].btn = btn;
+            ESP_LOGI(TAG, "Multi-knob %d mapped to virtual %d with btn=%d", phys_knob + 1, virt_knob + 1, btn);
             break;
         }
     }
-
-    if (is_chasing[knobNum][mode]) {
-        if (fabs(physical_norm - saved_knob_values[knobNum][mode]) < KNOB_CHASE_THRESHOLD) {
-            is_chasing[knobNum][mode] = false;
-            if (abs(raw - last_logged_raw[knobNum]) > KNOB_LOG_THRESHOLD || last_logged_raw[knobNum] == -1) {
-                ESP_LOGI(TAG, "Knob %d mode %d caught up—switching to physical tracking, handle=%p, channel=%d, raw=%d",
-                         knobNum + 1, mode, (void*)handle, channel, raw);
-                last_logged_raw[knobNum] = raw;
-            }
-        }
-        if (abs(raw - last_logged_raw[knobNum]) > KNOB_LOG_THRESHOLD || last_logged_raw[knobNum] == -1) {
-            ESP_LOGI(TAG, "Knob %d mode %d handle=%p, channel=%d, raw=%d", knobNum + 1, mode, (void*)handle, channel, raw);
-            last_logged_raw[knobNum] = raw;
-        }
-        return saved_knob_values[knobNum][mode];
-    } else if (abs(raw - last_logged_raw[knobNum]) > KNOB_LOG_THRESHOLD || last_logged_raw[knobNum] == -1) {
-        ESP_LOGI(TAG, "Knob %d mode %d handle=%p, channel=%d, raw=%d", knobNum + 1, mode, (void*)handle, channel, raw);
-        last_logged_raw[knobNum] = raw;
-    }
-
-    return physical_norm;
 }
 
 void shiftOutRegister(uint32_t bits_value) {
-    gpio_set_level(PIN_SET_D, 0);
-    for (uint8_t i = 0; i < LEDCOUNT; i++) {
-        bool bitValue = (bits_value >> i) & 0x01;
-        gpio_set_level(PIN_MOSI, !bitValue);  // Inverted for common anode
+    gpio_set_level(PIN_SET_D, 0);  // Clear shift register
+    for (int i = 31; i >= 0; i--) {
         gpio_set_level(PIN_CLK, 0);
+        gpio_set_level(PIN_MOSI, (bits_value & (1U << i)) ? 1 : 0);  // Inverted for common anode
         gpio_set_level(PIN_CLK, 1);
     }
-    gpio_set_level(PIN_SET_D, 1);
-    gpio_set_level(PIN_SET_D, 0);
-}
-
-void setLedBitState(uint8_t bitNum, StateType state) {
-    if (bitNum >= LEDCOUNT) {
-        ESP_LOGE(TAG, "Invalid bit %d", bitNum);
-        return;
-    }
-    LedState[bitNum] = state;
-    LedBlinkCount[bitNum] = 0;  // Stop blink if active
-}
-
-void blinkLedBit(uint8_t bitNum, speed blinkSpeed) {
-    if (bitNum >= LEDCOUNT) {
-        ESP_LOGE(TAG, "Invalid bit %d", bitNum);
-        return;
-    }
-    LedBlinkSpeed[bitNum] = blinkSpeed;
-    LedBlinkState[bitNum] = true;  // Start ON
-    LedState[bitNum] = SET;
-    uint32_t interval = (blinkSpeed == fast) ? FAST_BLINK_INTERVAL_MS : SLOW_BLINK_INTERVAL_MS;
-    LedBlinkCount[bitNum] = interval / UI_UPDATE_INTERVAL_MS;
-}
-
-void blinkLED(uint8_t ledNum, speed blinkSpeed, colorPattern pattern) {
-    if (ledNum >= (DUAL_LED_COUNT + SINGLE_LED_COUNT)) {
-        ESP_LOGE(TAG, "Invalid LED %d", ledNum);
-        return;
-    }
-    if (ledNum < DUAL_LED_COUNT) {
-        uint8_t red_bit = ledNum;       // 0-7
-        uint8_t green_bit = ledNum + DUAL_LED_COUNT;  // 8-15
-        switch (pattern) {
-            case green:
-                setLedBitState(red_bit, RESET);
-                setLedBitState(green_bit, SET);
-                return;
-            case red:
-                setLedBitState(red_bit, SET);
-                setLedBitState(green_bit, RESET);
-                return;
-            case yellow:
-                setLedBitState(red_bit, SET);
-                setLedBitState(green_bit, SET);
-                return;
-            case redGreen:
-                blinkLedBit(red_bit, blinkSpeed);  // Start red ON
-                LedBlinkState[green_bit] = false;
-                LedState[green_bit] = RESET;
-                LedBlinkSpeed[green_bit] = blinkSpeed;
-                LedBlinkCount[green_bit] = (blinkSpeed == fast ? FAST_BLINK_INTERVAL_MS : SLOW_BLINK_INTERVAL_MS) / UI_UPDATE_INTERVAL_MS;
-                return;
-            case redGreenYellow:
-                blinkLedBit(red_bit, blinkSpeed);
-                blinkLedBit(green_bit, blinkSpeed);
-                return;
-            case redYellow:
-                setLedBitState(green_bit, SET);
-                blinkLedBit(red_bit, blinkSpeed);
-                return;
-            case greenYellow:
-                setLedBitState(green_bit, SET);
-                LedBlinkState[red_bit] = false;
-                LedState[red_bit] = RESET;
-                LedBlinkSpeed[red_bit] = blinkSpeed;
-                LedBlinkCount[red_bit] = (blinkSpeed == fast ? FAST_BLINK_INTERVAL_MS : SLOW_BLINK_INTERVAL_MS) / UI_UPDATE_INTERVAL_MS;
-                return;
-            default:
-                ESP_LOGE(TAG, "Unsupported pattern %d", pattern);
-                return;
-        }
-    } else {
-        // Singles: ledNum 8-23 -> bits 16-31
-        uint8_t bit = ledNum + 8;
-        if (bit >= LEDCOUNT) {
-            ESP_LOGE(TAG, "Single LED %d overflow bit %d", ledNum, bit);
-            return;
-        }
-        if (pattern == red || pattern == green || pattern == yellow) {
-            setLedBitState(bit, SET);
-        } else {
-            blinkLedBit(bit, blinkSpeed);
-        }
-    }
+    gpio_set_level(PIN_SET_D, 1);  // Latch
 }
 
 void setLedState(uint8_t ledNum, led_state_t state) {
@@ -438,12 +345,60 @@ void setLedState(uint8_t ledNum, led_state_t state) {
 
 #ifdef ADVANCED_UI
 void setLedAdvanced(uint8_t ledNum, led_state_t baseState, float duty, const char* pattern) {
-    // Implement advanced features here, e.g., custom duty cycle blinks or morse
-    // For duty: Adjust LedBlinkCount based on duty * interval
-    // For pattern: Parse morse string to sequence blinks
     ESP_LOGW(TAG, "Advanced LED not implemented yet");
 }
 #endif
+
+void setLedBitState(uint8_t bitNum, StateType state) {
+    if (bitNum >= LEDCOUNT) {
+        ESP_LOGE(TAG, "Bit %d out of range", bitNum);
+        return;
+    }
+    LedState[bitNum] = state;
+}
+
+void blinkLedBit(uint8_t bitNum, speed blinkSpeed) {
+    if (bitNum >= LEDCOUNT) {
+        ESP_LOGE(TAG, "Bit %d out of range", bitNum);
+        return;
+    }
+    LedBlinkSpeed[bitNum] = blinkSpeed;
+    LedBlinkCount[bitNum] = (blinkSpeed == fast) ? FAST_BLINK_INTERVAL_MS : SLOW_BLINK_INTERVAL_MS;
+    LedBlinkState[bitNum] = true;
+}
+
+void blinkLED(uint8_t ledNum, speed blinkSpeed, colorPattern pattern) {
+    if (ledNum >= DUAL_LED_COUNT) {
+        blinkLedBit(ledNum + 8, blinkSpeed);
+        return;
+    }
+    uint8_t red_bit = ledNum;
+    uint8_t green_bit = ledNum + DUAL_LED_COUNT;
+    switch (pattern) {
+        case redGreenYellow:
+            setLedBitState(green_bit, SET);
+            blinkLedBit(red_bit, blinkSpeed);
+            return;
+        case redGreen:
+            setLedBitState(green_bit, SET);
+            blinkLedBit(red_bit, blinkSpeed);
+            return;
+        case redYellow:
+            setLedBitState(green_bit, SET);
+            blinkLedBit(red_bit, blinkSpeed);
+            return;
+        case greenYellow:
+            setLedBitState(green_bit, SET);
+            LedBlinkState[red_bit] = false;
+            LedState[red_bit] = RESET;
+            LedBlinkSpeed[red_bit] = blinkSpeed;
+            LedBlinkCount[red_bit] = (blinkSpeed == fast ? FAST_BLINK_INTERVAL_MS : SLOW_BLINK_INTERVAL_MS) / UI_UPDATE_INTERVAL_MS;
+            return;
+        default:
+            ESP_LOGE(TAG, "Unsupported pattern %d", pattern);
+            return;
+    }
+}
 
 void setButtonCallback(button_callback_t cb) {
     g_button_cb = cb;
@@ -451,35 +406,58 @@ void setButtonCallback(button_callback_t cb) {
 }
 
 void testUI(void *) {
-    // Demo simple API
-	while (1){
-    for (uint8_t i = 0; i < DUAL_LED_COUNT-5; i++) {
-        setLedState(i, LED_BLINK_SLOW);  // Dual slow blink (yellow/redGreenYellow)
-    	}
-    for (uint8_t i = DUAL_LED_COUNT; i < (DUAL_LED_COUNT + SINGLE_LED_COUNT-10); i++) {
-        setLedState(i, LED_BLINK_FAST);
-    	}
-    ESP_LOGI(TAG, "LED test activated with simple API");
-	vTaskDelay(pdMS_TO_TICKS(1000));  // change every second
-	for (uint8_t i = 5; i < DUAL_LED_COUNT; i++) {
-	        blinkLED(i, LED_BLINK_FAST, greenYellow);  // Dual slow blink (yellow/redGreenYellow)
-	    	}
-	    for (uint8_t i = DUAL_LED_COUNT+10; i < (DUAL_LED_COUNT + SINGLE_LED_COUNT); i++) {
-	        setLedState(i, LED_BLINK_SLOW);
-	    	}
-	    ESP_LOGI(TAG, "LED test activated with different simple API");
-		vTaskDelay(pdMS_TO_TICKS(1000));  // change every second
-	
-	}
+    while (1) {
+        for (uint8_t i = 0; i < DUAL_LED_COUNT - 5; i++) {
+            setLedState(i, LED_BLINK_SLOW);  // Dual slow blink
+        }
+        for (uint8_t i = DUAL_LED_COUNT; i < (DUAL_LED_COUNT + SINGLE_LED_COUNT - 10); i++) {
+            setLedState(i, LED_BLINK_FAST);
+        }
+        ESP_LOGI(TAG, "LED test activated with simple API");
+        vTaskDelay(pdMS_TO_TICKS(1000));  // Change every second
+
+        for (uint8_t i = 5; i < DUAL_LED_COUNT; i++) {
+            blinkLED(i, fast, greenYellow);  // Dual fast blink
+        }
+        for (uint8_t i = DUAL_LED_COUNT + 10; i < (DUAL_LED_COUNT + SINGLE_LED_COUNT); i++) {
+            setLedState(i, LED_BLINK_SLOW);
+        }
+        ESP_LOGI(TAG, "LED test activated with different simple API");
+        vTaskDelay(pdMS_TO_TICKS(1000));  // Change every second
+    }
 }
+
 void updateUITask(void *pvParameters) {
     ESP_LOGI(TAG, "UI task started on core %d", xPortGetCoreID());
     TickType_t last_wake = xTaskGetTickCount();
     uint32_t last_led_bits = 0;
 
+    static float last_knob_values[NUM_KNOBS] = { -1.0f };  // For change detection
+
     while (1) {
-        // Poll buttons FIRST (minimize CLK overlap with LED shift)
+        // Poll buttons first
         pollButtons();
+
+        // Poll only registered knobs
+        for (knob_index_t i = 0; i < NUM_KNOBS; i++) {
+            if (knob_params[i] == NULL) continue;  // Skip unregistered
+
+            float val = readKnob(i);
+            if (val < 0.0f) {
+                ESP_LOGE(TAG, "Error reading knob %d", i);
+                continue;
+            }
+
+            ESP_LOGD(TAG, "Knob %d checked: val %.2f, last %.2f", i, val, last_knob_values[i]);  // LOGD to reduce spam
+            if (fabs(val - last_knob_values[i]) > (HYSTERESIS_THRESHOLD / 4095.0f)) {  // Increased to 30 for noise filter
+                ESP_LOGI(TAG, "Knob %d raw value changed to %.2f", i, val);  // LOGI for changes
+                last_knob_values[i] = val;
+                *knob_params[i] = val;  // Direct update
+                knobsUpdated = 1;
+                ESP_LOGI(TAG, "Knob %d param updated to %.2f", i, val);  // LOGI for updates
+            }
+        }
+
 
         uint32_t led_bits = 0;
         for (uint8_t i = 0; i < LEDCOUNT; i++) {
@@ -488,7 +466,6 @@ void updateUITask(void *pvParameters) {
                 if (LedBlinkCount[i] == 0) {
                     LedBlinkState[i] = !LedBlinkState[i];
                     LedState[i] = LedBlinkState[i] ? SET : RESET;
-
                     uint32_t interval = (LedBlinkSpeed[i] == fast) ? FAST_BLINK_INTERVAL_MS : SLOW_BLINK_INTERVAL_MS;
                     LedBlinkCount[i] = interval / UI_UPDATE_INTERVAL_MS;
                 }
@@ -512,24 +489,4 @@ bool isButtonPressed(uint8_t btnNum) {
         return false;
     }
     return buttonCurrentStatus[btnNum - 1];
-}
-
-void initMultiKnob(knob_index_t phys_knob, knob_index_t virt_knob, uint8_t btn) {
-    if (phys_knob >= NUM_KNOBS || virt_knob >= NUM_KNOBS) {
-        ESP_LOGE(TAG, "Invalid knob %d or %d", phys_knob + 1, virt_knob + 1);
-        return;
-    }
-    if (btn != 0 && (btn < 1 || btn > BUTTONSCOUNT)) {
-        ESP_LOGE(TAG, "Invalid button %d", btn);
-        return;
-    }
-    for (int i = 0; i < NUM_KNOBS; i++) {
-        if (multi_knob_map[i].phys_knob == 0) {
-            multi_knob_map[i].phys_knob = phys_knob;
-            multi_knob_map[i].virt_knob = virt_knob;
-            multi_knob_map[i].btn = btn;
-            ESP_LOGI(TAG, "Multi-knob %d mapped to virtual %d with btn=%d", phys_knob + 1, virt_knob + 1, btn);
-            break;
-        }
-    }
 }

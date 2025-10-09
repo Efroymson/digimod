@@ -18,10 +18,10 @@ typedef enum { redGreenYellow, redGreen, redYellow, greenYellow, red, green, yel
 #define DUAL_LED_COUNT 8
 #define SINGLE_LED_COUNT 16  // Bits 16-31 (total 32)
 #define BUTTONSCOUNT 16
-#define HYSTERESIS_THRESHOLD 50
+#define HYSTERESIS_THRESHOLD 90.0f  // User-tuned for smoothness
 #define FAST_BLINK_INTERVAL_MS 100
 #define SLOW_BLINK_INTERVAL_MS 500
-#define UI_UPDATE_INTERVAL_MS 10
+#define UI_UPDATE_INTERVAL_MS 50  // was 10, too fast??
 #define LONG_PRESS_THRESHOLD_US 1000000   // 1s
 #define KNOB_CHASE_THRESHOLD 0.05f  // 5% closeness
 
@@ -64,6 +64,8 @@ extern button_state_t buttons[BUTTONSCOUNT];  // Button states (unused in chetu-
  */
 typedef void (*button_callback_t)(uint8_t buttonNum, PressType pressType);
 
+void testUI(void *);
+
 void initUI(void);
 /**
  * @brief Read knob value as normalized float (0.0-1.0), with chasing mode.
@@ -76,10 +78,17 @@ float readKnob(knob_index_t knobNum);
  * @brief Set saved value for knob chasing (for patch recall).
  * @param knobNum Knob index (physical or virtual).
  * @param value Normalized saved value (0.0-1.0).
- * @param enable_chase True to enable chasing mode.
  * @param mode Mode (0: default, 1: btn-held).
+ * @param enable_chase True to enable chasing.
  */
-void setKnobSavedValue(knob_index_t knobNum, float value, bool enable_chase, uint8_t mode);
+void setKnobSavedValue(knob_index_t knobNum, float value, uint8_t mode, bool enable_chase);
+
+/**
+ * @brief Register a parameter pointer for a knob (updated on change).
+ * @param knobNum Knob index.
+ * @param paramPtr Pointer to float param to update.
+ */
+void setKnobParam(knob_index_t knobNum, volatile float* paramPtr);
 
 /**
  * @brief Initialize multi-mode knob with a button for a virtual knob.
@@ -128,6 +137,8 @@ void setButtonCallback(button_callback_t cb);
  * @return True if pressed, false otherwise.
  */
 bool isButtonPressed(uint8_t btnNum);
+
+extern volatile uint8_t knobsUpdated;  // Flag set when any knob changes
 
 #ifdef __cplusplus
 }
