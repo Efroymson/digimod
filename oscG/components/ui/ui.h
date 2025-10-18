@@ -5,6 +5,7 @@
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
 #include "freertos/FreeRTOS.h"
+#include "esp_log.h"
 
 #ifdef __cplusplus
 extern "C" {
