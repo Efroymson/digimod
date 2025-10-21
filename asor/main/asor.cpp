@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <algorithm>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -22,15 +23,21 @@
 #define PRINT_INTERVAL 500  // Print every 500 packets (~1 second)
 #define NUM_OSCS 10  // 10 pulse oscillators (harp-inspired "cloud")
 #define MAX_TUNE_SPREAD_SEMITONES 2.0f  // Full CW: 2 semitones total spread (±1)
-#define CLOUD_GAIN 0.1f  // Post-mix gain (adjust 0.1-0.2 for volume without clipping)
+#define CLOUD_GAIN 0.2f  // Full post-mix gain (increased for volume; monitor for clipping)
 
+#define TAG "ASOR"
+
+void sender_task(void* pvParameters);
+void receiver_task(void* pvParameters);
 // 10 oscillators
 daisysp::Oscillator oscs[NUM_OSCS];
 
-// Global params (registered with setKnobParam in ui.c)
-volatile float base_freq = 440.0f;  // KNOB1: Base frequency
+// Global params (registered with setKnobParam for UI updates)
+volatile float raw_base_freq = 440.0f;  // Raw knob value from KNOB1, DMA-updated
+float base_freq = 440.0f;  // KNOB1: Base frequency
 volatile float tune_spread = 0.0f;  // KNOB2: Tuning spread (0.0-1.0)
 volatile float pw_spread = 0.0f;    // KNOB3: PW spread (0.0-1.0)
+//volatile uint8_t knobsUpdated = 0;  // Flag for changes
 
 // Define PACK_L24_BE if not defined elsewhere
 #ifndef PACK_L24_BE
@@ -40,20 +47,30 @@ volatile float pw_spread = 0.0f;    // KNOB3: PW spread (0.0-1.0)
     (p)[2] = (v) & 0xFF;         \
 } while (0)
 #endif
-void sender_task(void* pvParameters);
+void exampleButtonCb(uint8_t btn, PressType type) {
+    const char* type_str = (type == SHORT_PRESS ? "short" : (type == LONG_PRESS ? "long" : "double"));
+    ESP_LOGI(TAG, "Synth: Btn %d %s (e.g., route pot%d to osc freq via patchSave)", btn, type_str, btn);
+    // Future: switch(btn) { case 1: if(type==SHORT_PRESS) set_virtual_route(POT_ADC3, OSC_FREQ); }
+}
+
 void update_cloud_params() {
-    // Update base freq from KNOB1 (e.g., octave mapping, as in main.cpp)
-    base_freq = 130.81f * powf(2.0f, tune_spread * 7.0f);  // C3 to C10 range (adjust as needed)
+    // Limit raw_base_freq to prevent powf overflow (cast volatile to float)
+    float safe_raw = std::min(0.4f, (float)raw_base_freq);  // Cap at ~3 octaves
+    base_freq = 130.81f * powf(2.0f, safe_raw * 7.0f);  // C3 to ~C9
 
     // Update oscillators with spread
     for (int i = 0; i < NUM_OSCS; ++i) {
-        // Tuning spread: center around base, ± (tune_spread * MAX_TUNE_SPREAD_SEMITONES / 2)
         float detune_ratio = powf(2.0f, ((i - (NUM_OSCS - 1.0f) / 2.0f) / (NUM_OSCS - 1.0f)) * tune_spread * MAX_TUNE_SPREAD_SEMITONES / 12.0f);
         oscs[i].SetFreq(base_freq * detune_ratio);
 
-        // PW spread: center 50%, ± (pw_spread * 40%)
         float pw = 0.5f + ((i - (NUM_OSCS - 1.0f) / 2.0f) / (NUM_OSCS - 1.0f)) * pw_spread * 0.4f;
         oscs[i].SetPw(pw);
+    }
+
+    // Debug: Log knob values every 500 packets
+    static int debug_count = 0;
+    if (debug_count++ % 500 == 0) {
+        printf("Debug: raw_base_freq: %f, tune_spread: %f, pw_spread: %f\n", raw_base_freq, tune_spread, pw_spread);
     }
 }
 
@@ -73,17 +90,24 @@ extern "C" void app_main(void) {
     // Connect to network
     ESP_ERROR_CHECK(net_connect());
 
-    // Initialize UI and knobs (as in main.cpp)
+    // Initialize UI and knobs
     initUI();
-    setKnobParam(KNOB1, &base_freq);  // Base freq
-    setKnobParam(KNOB2, &tune_spread);  // Tuning spread
-    setKnobParam(KNOB3, &pw_spread);  // PW spread
-
+    setUILogLevel(ESP_LOG_DEBUG);  // Enable debug for testing
+    setButtonCallback(exampleButtonCb);
+	
+	setKnobParam(KNOB1, &raw_base_freq);  // Raw knob value
+	setKnobParam(KNOB2, &tune_spread);    // Tuning spread
+	setKnobParam(KNOB3, &pw_spread);      // PW spread
+	base_freq = raw_base_freq;  // Sync initial value
+	knobsUpdated = 1;  // Force initial update
+	
     // Initialize oscillators
+	base_freq = 440.0f;  // Start at A4
     for (int i = 0; i < NUM_OSCS; ++i) {
         oscs[i].Init(SAMPLE_RATE);
         oscs[i].SetWaveform(daisysp::Oscillator::WAVE_SQUARE);  // Pulse wave for PW control
-        oscs[i].SetAmp(1.0f);  // Full amp (headroom via post-mix)
+        oscs[i].SetAmp(0.3f);  // Full amp (headroom via post-mix)
+		oscs[i].SetFreq(base_freq);  // Ensure oscillation
     }
 
     // Update initial params
@@ -103,11 +127,13 @@ extern "C" void app_main(void) {
            (unsigned long)((multicast_ip >> 8) & 0xFF),
            (unsigned long)(multicast_ip & 0xFF));
 
-    // Sender task (no receiver for now, as focus on synth generation)
+    // Sender task
     xTaskCreate(sender_task, "sender_task", 4096, (void*)&multicast_ip, 5, NULL);
 
-    // end task, we do knob updates in sender task
-    
+    // Receiver task (stub for now)
+    xTaskCreate(receiver_task, "receiver_task", 4096, (void*)&multicast_ip, 5, NULL);
+
+     xTaskCreatePinnedToCore(updateUITask, "updateUI", 2048, NULL, 5, NULL, 1); // Pin to core 1
 }
 
 void sender_task(void* pvParameters) {
@@ -147,27 +173,35 @@ void sender_task(void* pvParameters) {
     while (1) {
         uint8_t buffer[PACKET_SIZE];  // 288 bytes
         int offset = 0;
-        update_cloud_params(); // update params every block
-        for (int i = 0; i < BLOCK_SIZE; ++i) {  // 96 samples
-            float mixed_sample = 0.0f;
+		if (knobsUpdated) {
+		    update_cloud_params();
+		    knobsUpdated = 0;
+		}
+		for (int i = 0; i < BLOCK_SIZE; ++i) {  // 96 samples
+		    float mixed_sample = 0.0f;
 
-            // Mix 10 oscillators
-            for (int j = 0; j < NUM_OSCS; ++j) {
-                mixed_sample += oscs[j].Process();  // Sum (headroom via /NUM_OSCS)
-            }
+		    // Mix 10 oscillators (use current params)
+		    for (int j = 0; j < NUM_OSCS; ++j) {
+		        mixed_sample += oscs[j].Process();
+		    }
 
-            // Post-mix gain (avoids clipping)
-          //  mixed_sample = (mixed_sample / NUM_OSCS) * CLOUD_GAIN; // xxx not worried about clipping, we have silence
+		    // Clamp with headroom and apply gain
+		    mixed_sample = std::max(-1.0f, std::min(1.0f, mixed_sample / NUM_OSCS)) * CLOUD_GAIN;
 
-            // Pack 24-bit
-            int32_t value = static_cast<int32_t>(mixed_sample * 8388607.0f);
-            uint8_t tmp[3];
-            PACK_L24_BE(tmp, value);
-            buffer[offset++] = tmp[0];
-            buffer[offset++] = tmp[1];
-            buffer[offset++] = tmp[2];
-        }
+		    // Debug: Check variation every 500 packets
+		    if (i == 0 && packet_count % 500 == 0) {
+		        printf("Mixed sample at packet %d: %f, base_freq: %f, tune_spread: %f, pw_spread: %f\n",
+		               packet_count, mixed_sample, base_freq, tune_spread, pw_spread);
+		    }
 
+		    // Pack 24-bit
+		    int32_t value = static_cast<int32_t>(mixed_sample * 8388607.0f);
+		    uint8_t tmp[3];
+		    PACK_L24_BE(tmp, value);
+		    buffer[offset++] = tmp[0];
+		    buffer[offset++] = tmp[1];
+		    buffer[offset++] = tmp[2];
+		}
         int sent = sendto(sock, buffer, PACKET_SIZE, 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
         if (sent > 0 && (++packet_count % PRINT_INTERVAL == 0)) {
             printf("Sender: Sent %d bytes (packet #%d)\n", sent, packet_count);
@@ -185,7 +219,7 @@ void sender_task(void* pvParameters) {
 }
 
 void receiver_task(void* pvParameters) {
-    // Optional: Stub for future use
+    // Stub for future use
     vTaskDelay(pdMS_TO_TICKS(1000));
     vTaskDelete(NULL);
 }

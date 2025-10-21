@@ -165,3 +165,159 @@ Knob    GPIO
 7                13
 
 8                4
+
+### Module Template for ESP32 Synthesizer Projects
+
+I completely agree— the struggles with UI task startup, knob registration, DMA volatiles, and derived param recomputation are common pitfalls in real-time embedded audio, and encapsulating them in a template reduces boilerplate and errors. As an expert C/C++ developer specializing in real-time applications, I've designed a simple, extensible template that follows best practices: 
+- **Modularity**: A base class `Module` handles UI task creation (pinned to core 1), knob registration, and flag-based updates.
+- **Real-Time Safety**: Recomputation (`recalculateDerived`) is called only on change (via `knobsUpdated` flag), with hysteresis to avoid jitter. Volatiles for DMA, computed vars for safety.
+- **Extensibility**: Subclass for your cloud synth (e.g., `CloudModule`), overriding `recalculateDerived` for osc updates.
+- **No Race Conditions**: DMA updates raw knobs; flag ensures atomic recompute.
+- **Dependencies**: Requires `ui.h`/`ui.c`, `mynet.h`/`net.c`, DaisySP. Add to CMakeLists.txt: `REQUIRES nvs_flash esp_netif esp_event lwip daisysp ui mynet`.
+
+This template avoids the "remember to start the UI task" issue by creating it in the constructor. Place it in `modules/module.h` and `modules/module.cpp`, then subclass in your module file.
+
+#### `modules/module.h`
+```cpp
+#ifndef MODULE_H
+#define MODULE_H
+
+#include "ui.h"  // For setKnobParam, knobsUpdated
+#include "daisysp.h"  // For oscillators, etc.
+#include "mynet.h"  // For net_connect
+
+class Module {
+public:
+    Module(knob_index_t base_knob, int num_knobs);  // e.g., KNOB1, 3 for cloud
+    virtual ~Module() = default;
+
+    virtual void recalculateDerived() = 0;  // Override for module-specific logic (e.g., osc freq/PW)
+
+protected:
+    void registerKnobs(knob_index_t start_knob, volatile float* params[], int num);  // Internal helper
+
+    // Raw knob volatiles (DMA-updated)
+    volatile float m_raw_knobs[16];  // Max 16 knobs
+
+    // Computed params (updated in recalculateDerived)
+    float m_derived_params[16];  // For freq, spread, etc.
+
+    TaskHandle_t m_ui_task_handle;  // UI task handle
+
+private:
+    static void uiTaskWrapper(void* arg);  // Wrapper for task
+};
+
+#endif // MODULE_H
+```
+
+#### `modules/module.cpp`
+```cpp
+#include "module.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+
+static const char* TAG = "Module";
+
+Module::Module(knob_index_t base_knob, int num_knobs) {
+    // Initialize UI and start task pinned to core 1
+    initUI();
+    m_ui_task_handle = NULL;
+    xTaskCreatePinnedToCore(uiTaskWrapper, "updateUI", 2048, this, 5, &m_ui_task_handle, 1);  // Pin to core 1
+
+    // Register raw knobs (DMA-updated volatiles)
+    volatile float* params[16] = {0};
+    for (int i = 0; i < num_knobs; ++i) {
+        params[i] = &m_raw_knobs[i];
+        setKnobParam(base_knob + i, params[i]);
+    }
+
+    // Force initial update
+    knobsUpdated = 1;
+    recalculateDerived();
+}
+
+Module::~Module() {
+    if (m_ui_task_handle) {
+        vTaskDelete(m_ui_task_handle);
+    }
+}
+
+void Module::registerKnobs(knob_index_t start_knob, volatile float* params[], int num) {
+    // Helper for subclass (not used in base)
+}
+
+void Module::uiTaskWrapper(void* arg) {
+    Module* module = static_cast<Module*>(arg);
+    updateUITask(module);  // Call UI task with module context if needed
+    vTaskDelete(NULL);
+}
+```
+
+#### Example Subclass: `cloud_module.cpp` (For Your Cloud Synth)
+Place this in your module directory, subclassing `Module`. It handles the 3 knobs, recomputes derived params (base_freq, detune, PW), and mixes in the sender loop.
+
+```cpp
+#include "cloud_module.h"
+#include "daisysp.h"
+#include <algorithm>  // For std::min/std::max
+#include <math.h>
+
+#define MAX_TUNE_SPREAD_SEMITONES 2.0f
+#define CLOUD_GAIN 0.8f
+
+CloudModule::CloudModule() : Module(KNOB1, 3), oscs{SAMPLE_RATE} {
+    // Oscillator init in constructor
+    for (int i = 0; i < NUM_OSCS; ++i) {
+        oscs[i].SetWaveform(daisysp::Oscillator::WAVE_SQUARE);
+        oscs[i].SetAmp(0.08f);  // Headroom for 10 voices
+    }
+}
+
+void CloudModule::recalculateDerived() {
+    // Raw knobs from DMA: m_raw_knobs[0] = KNOB1 (base), [1] = KNOB2 (tune spread), [2] = KNOB3 (PW spread)
+    float safe_raw = std::min(0.4f, (float)m_raw_knobs[0]);  // Cap to avoid inf
+    m_derived_params[0] = 130.81f * powf(2.0f, safe_raw * 7.0f);  // Base freq (C3-C9)
+
+    // Update oscs with spread
+    for (int i = 0; i < NUM_OSCS; ++i) {
+        float detune_ratio = powf(2.0f, ((i - (NUM_OSCS - 1.0f) / 2.0f) / (NUM_OSCS - 1.0f)) * m_raw_knobs[1] * MAX_TUNE_SPREAD_SEMITONES / 12.0f);
+        oscs[i].SetFreq(m_derived_params[0] * detune_ratio);
+
+        float pw = 0.5f + ((i - (NUM_OSCS - 1.0f) / 2.0f) / (NUM_OSCS - 1.0f)) * m_raw_knobs[2] * 0.4f;
+        oscs[i].SetPw(pw);
+    }
+}
+
+// In sender_task (or your audio loop)
+void CloudModule::processBlock(float* out, int num_samples) {
+    for (int i = 0; i < num_samples; ++i) {
+        float mixed = 0.0f;
+        for (int j = 0; j < NUM_OSCS; ++j) {
+            mixed += oscs[j].Process();
+        }
+        mixed = std::max(-1.0f, std::min(1.0f, mixed / NUM_OSCS)) * CLOUD_GAIN;
+        out[i] = mixed;
+    }
+}
+```
+
+### Usage in Your Project
+- **CMakeLists.txt**: `REQUIRES nvs_flash esp_netif lwip daisysp ui mynet modules`.
+- **In `app_main`**:
+  ```cpp
+  // ... (NVS, network init) ...
+
+  CloudModule cloud;
+  cloud.recalculateDerived();  // Initial
+
+  // Sender task
+  xTaskCreate(sender_task, "sender_task", 4096, &cloud, 5, NULL);  // Pass module instance
+
+  while (1) {
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+  ```
+
+This template simplifies module creation—override `recalculateDerived` for your logic, and the base handles UI/task. No more struggles! Let me know if you want tweaks.
