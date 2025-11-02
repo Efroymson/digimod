@@ -1,4 +1,3 @@
-# base_module.py
 import socket
 import threading
 import struct
@@ -35,8 +34,8 @@ class ProtocolMessageType(Enum):
     CANCEL = 8
 
 class ProtocolMessage:
-    def __init__(self, type: int, module_id: str, mod_type: str = '', io_id: str = '', payload: Dict or bytes = None):
-        self.type = type
+    def __init__(self, type_val: int, module_id: str, mod_type: str = '', io_id: str = '', payload: Any = None):
+        self.type = type_val
         self.module_id = module_id
         self.mod_type = mod_type
         self.io_id = io_id
@@ -101,19 +100,35 @@ class BaseModule:
         while True:
             time.sleep(0.05)
             with self.lock:
+                changed = False
                 for io, state in list(self.led_states.items()):
+                    old_state = state
                     if state == LedState.BLINK_SLOW:
                         ms = int(time.time() * 1000) % (BLINK_SLOW_MS * 2)
-                        self.led_states[io] = LedState.SOLID if ms < BLINK_SLOW_MS else LedState.OFF
+                        new_state = LedState.SOLID if ms < BLINK_SLOW_MS else LedState.OFF
+                        if new_state != old_state:
+                            self.led_states[io] = new_state
+                            changed = True
                     elif state == LedState.BLINK_RAPID:
                         ms = int(time.time() * 1000) % (BLINK_RAPID_MS * 2)
-                        self.led_states[io] = LedState.SOLID if ms < BLINK_RAPID_MS else LedState.OFF
-            with self.lock:
-                for io, state in self.led_states.items():
-                    try:
-                        self.gui_queue.put_nowait((io, state.name))
-                    except queue.Full:
-                        pass
+                        new_state = LedState.SOLID if ms < BLINK_RAPID_MS else LedState.OFF
+                        if new_state != old_state:
+                            self.led_states[io] = new_state
+                            changed = True
+                if changed:
+                    # Queue only changed states
+                    for io, state in self.led_states.items():
+                        try:
+                            self.gui_queue.put_nowait((io, state.name))
+                        except queue.Full:
+                            pass
+                    if self.root:  # Event-driven drain
+                        self.root.after(20, self._drain_queue_once)
+
+    def _drain_queue_once(self):
+        self._update_display()
+        if not self.gui_queue.empty():
+            self.root.after(20, self._drain_queue_once)
 
     def _update_display(self):
         while True:
@@ -126,7 +141,7 @@ class BaseModule:
                 break
 
     def handle_msg(self, msg: ProtocolMessage):
-        pass
+        pass  # Overridden in mixins
 
     def _start_receiver(self, io, group):
         threading.Thread(target=self._receiver_stub, args=(io, group), daemon=True).start()
