@@ -66,40 +66,37 @@ class AudioOutModule(PatchProtocol, ConnectionProtocol, BaseModule):
         new_thread.start()
         setattr(self, key, new_thread)
 
-    def _receiver_stub(self, group, q, io):
+    # In _receiver_stub (~L80): Robust timeout/full
+    def _receiver_stub(self, group, q, io_id):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         sock.bind(('', UDP_AUDIO_PORT))
         mreq = struct.pack("4sl", socket.inet_aton(group), socket.INADDR_ANY)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-        sock.settimeout(RECV_TIMEOUT)
-        logger.info(f"Audio receiver started for {io} on {group}")
+        sock.settimeout(0.1)  # Longer for sim jitter
+        drop_count = 0
         while True:
             try:
                 data, _ = sock.recvfrom(PACKET_SIZE)
                 if len(data) == PACKET_SIZE:
-                    samples = []
-                    for i in range(0, PACKET_SIZE, 3):
-                        sample_data = data[i:i+3]
-                        if len(sample_data) < 3:
-                            samples.append(0)
-                            continue
-                        unsigned_val = struct.unpack('>I', b'\x00' + sample_data)[0]
-                        signed_val = unsigned_val if unsigned_val < (1 << 23) else unsigned_val - (1 << 24)
-                        samples.append(signed_val)
-                    arr = np.array(samples[:BLOCK_SIZE], dtype=np.int32)
-                    try:
-                        q.put_nowait(arr)
-                    except queue.Full:
-                        logger.debug(f"{io} queue full, dropped packet")
+                    samples = [self._unpack_sample(data[i:i+3]) for i in range(0, len(data), 3)]
+                    q.put_nowait(np.array(samples[:BLOCK_SIZE], dtype=np.int32))
+                    drop_count = 0
                 else:
-                    q.put_nowait(np.zeros(BLOCK_SIZE, dtype=np.int32))
+                    logger.debug(f"Short packet for {io_id}: {len(data)} bytes")
             except socket.timeout:
-                q.put_nowait(np.zeros(BLOCK_SIZE, dtype=np.int32))
+                drop_count += 1
+                if drop_count % 100 == 0:  # Log every ~10s
+                    logger.warning(f"{io_id} receiver timeout spam: {drop_count}")
+                continue  # No zeros push
+            except queue.Full:
+                logger.warning(f"{io_id} queue full: Drop block")
+                drop_count += 1
+                continue  # No raise/block
             except Exception as e:
-                logger.warning(f"Receiver {io} error: {e}")
-                q.put_nowait(np.zeros(BLOCK_SIZE, dtype=np.int32))
+                logger.warning(f"{io_id} receiver error: {e}")
+                drop_count += 1
 
     # def _audio_callback(self, outdata, frames, time, status):
     #     left = self.left_q.get() if not self.left_q.empty() else np.zeros(frames, dtype=np.int32)
@@ -115,4 +112,5 @@ class AudioOutModule(PatchProtocol, ConnectionProtocol, BaseModule):
             self.root.destroy()
 
     def handle_msg(self, msg: ProtocolMessage):
-        super().handle_msg(msg)
+        # No lock: Atomic
+        super().handle_msg(msg)  # Chain

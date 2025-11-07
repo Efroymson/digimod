@@ -130,12 +130,13 @@ class MainApp:
         self.root.after(200, self._update_graph)
 
     def show_graph(self):
-        if not self.viewer:
+        if self.viewer and self.viewer.winfo_exists():
+            self.viewer.lift()
+        else:
             self.viewer = PatchViewer(self.root)
             for mod_id, typ in self.deferred_modules:
                 self.viewer.add_module(mod_id, typ)
             self.deferred_modules = []
-        self.viewer.lift()
         self._update_graph()
 
     def _update_graph(self):

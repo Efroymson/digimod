@@ -40,39 +40,47 @@ class OscModule(PatchProtocol, ConnectionProtocol, BaseModule):
         self._setup_gui(parent_root)
         # Set root after GUI for after() chains
         self.set_root(self.root)
-        # Trace for user changes only (no fire on programmatic set)
-        self.freq_var.trace('w', self._on_freq_change)
-        self.fm_var.trace('w', self._on_fm_change)
         self.start_sending()
 
     def _setup_gui(self, parent_root):
         self.root = tk.Toplevel(parent_root) if parent_root else tk.Tk()
         self.root.title(f"Osc {self.module_id}")
         ttk.Button(self.root, text="FM Input", command=lambda: self.connect_input("fm")).pack(pady=5)
-        ttk.Button(self.root, text="Audio Output", command=lambda: self.initiate_connect("audio")).pack(pady=5)
-        self.freq_scale = ttk.Scale(self.root, from_=20, to=20000, orient="horizontal", variable=self.freq_var)
+        ttk.Button(self.root, text="Audio Output", command=lambda:   self.initiate_connect("audio")).pack(pady=5)
+        # In _setup_gui (~L50-60): Add command= to scales
+        self.freq_scale = ttk.Scale(self.root, from_=20, to=20000, orient="horizontal", 
+                                    variable=self.freq_var, command=self._on_freq_change)
         self.freq_scale.pack(pady=5)
-        self.fm_scale = ttk.Scale(self.root, from_=0, to=1, orient="horizontal", variable=self.fm_var)
+        self.fm_scale = ttk.Scale(self.root, from_=0, to=1, orient="horizontal", 
+                                  variable=self.fm_var, command=self._on_fm_change)
         self.fm_scale.pack(pady=5)
         self.gui_leds["fm"] = tk.Label(self.root, text="FM LED", bg="gray", width=10, height=1)
         self.gui_leds["fm"].pack(pady=2)
         self.gui_leds["audio"] = tk.Label(self.root, text="Audio LED", bg="gray", width=10, height=1)
         self.gui_leds["audio"].pack(pady=2)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
 
-    def _on_freq_change(self, *args):
-        val = self.freq_var.get()
-        if abs(val - self.controls["freq"]) < HYSTERESIS:
-            return
-        self.controls["freq"] = val
-        logger.info(f"Osc {self.module_id}: Freq set to {val}")
+    # osc_module.py (~L60-80): Optional—take val, drop *args/get()
+    def _on_freq_change(self, val):
+        try:
+            fval = float(val)
+            if abs(fval - self.controls["freq"]) < HYSTERESIS:
+                return
+            self.controls["freq"] = fval
+            logger.info(f"Osc {self.module_id}: Freq set to {fval}")
+        except ValueError:
+            pass
 
-    def _on_fm_change(self, *args):
-        val = self.fm_var.get()
-        if abs(val - self.controls["fm_depth"]) < HYSTERESIS:
-            return
-        self.controls["fm_depth"] = val
-        logger.info(f"Osc {self.module_id}: FM depth set to {val}")
+    def _on_fm_change(self, val):
+        try:
+            fval = float(val)
+            if abs(fval - self.controls["fm_depth"]) < HYSTERESIS:
+                return
+            self.controls["fm_depth"] = fval
+            logger.info(f"Osc {self.module_id}: FM depth set to {fval}")
+        except ValueError:
+            pass
 
     def _sync_ui(self):
         # Silent set (no trace fire)
@@ -106,11 +114,14 @@ class OscModule(PatchProtocol, ConnectionProtocol, BaseModule):
 
     def start_sending(self):
         if self._audio_thread is None or not self._audio_thread.is_alive():
-            with self.lock:
-                self.led_states["audio"] = LedState.SOLID
-            self._audio_thread = threading.Thread(target=self._audio_loop, daemon=True)
-            self._audio_thread.start()
+            self.led_states["audio"] = LedState.SOLID  # Atomic
+            self._queue_led_update("audio", LedState.SOLID)
+            # self._audio_thread = threading.Thread(target=self._audio_loop, daemon=True)  # Comment for protocol mode
+            # self._audio_thread.start()
+            logger.info("Audio sender ready (protocol mode - no send)")
 
+    # Comment _audio_loop for testing
+    # def _audio_loop(self): ...  # Comment entire for no UDP spam
     def _audio_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         ttl = struct.pack('b', 1)
