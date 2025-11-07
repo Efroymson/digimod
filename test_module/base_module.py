@@ -30,14 +30,14 @@ class ProtocolMessageType(Enum):
     INITIATE = 6
     CONNECT = 7
     CANCEL = 8
-    COMPATIBLE = 9  # Input press in initial: Broadcast group for compatible outputs
-    SHOW_CONNECTED = 10  # Short press on connected input: Flash output
+    COMPATIBLE = 9
+    SHOW_CONNECTED = 10
 
 class ProtocolMessage:
     def __init__(self, type_val: int, module_id: str, mod_type: str = '', io_id: str = '', payload: Any = None):
         self.type = type_val
         self.module_id = module_id
-        self.mod_type = mod_type  # Fixed: Consistent
+        self.mod_type = mod_type
         self.io_id = io_id
         self.payload = payload or {}
 
@@ -51,7 +51,7 @@ class ProtocolMessage:
     def unpack(cls, data: bytes):
         type_val = struct.unpack('B', data[0:1])[0]
         module_id = data[1:33].decode('utf-8').rstrip('\0')
-        mod_type = data[33:65].decode('utf-8').rstrip('\0')  # Fixed: mod_type
+        mod_type = data[33:65].decode('utf-8').rstrip('\0')
         io_id = data[65:97].decode('utf-8').rstrip('\0')
         payload_data = data[97:]
         try:
@@ -61,7 +61,7 @@ class ProtocolMessage:
         return cls(type_val, module_id, mod_type, io_id, payload)
 
 class BaseModule:
-    next_ip_octet = 1  # Sequential IP (1-255)
+    next_ip_octet = 1
 
     def __init__(self, mod_id: str, mod_type: str):
         self.module_id = mod_id
@@ -75,7 +75,7 @@ class BaseModule:
         self.control_ranges = {}
         self.led_states = {}
         self.gui_leds = {}
-        self.pending_io = None
+        self.last_push_time = {}  # Initialize here to avoid AttributeError
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
@@ -83,14 +83,22 @@ class BaseModule:
         mreq = struct.pack("4sl", socket.inet_aton(CONTROL_MULTICAST), socket.INADDR_ANY)
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         self.sock.settimeout(RECV_TIMEOUT)
-        # No lock: Distributed Ethernet sim
         self.root = None
         self.gui_queue = queue.Queue(maxsize=32)
         self._listener_thread = threading.Thread(target=self._listen, daemon=True)
         self._listener_thread.start()
-        
+
     def set_root(self, root):
         self.root = root
+        if root:
+            # Start periodic drain for reliable GUI updates
+            self.root.after(50, self._periodic_drain)
+
+    def _periodic_drain(self):
+        """Periodic GUI queue drain for reliable LED updates."""
+        if self.root and self.root.winfo_exists():
+            self._update_display()
+            self.root.after(50, self._periodic_drain)
 
     def _listen(self):
         while True:
@@ -132,18 +140,27 @@ class BaseModule:
         self._update_display()
 
     def _queue_led_update(self, io: str, state: LedState):
+        # Ensure last_push_time exists
+        if not hasattr(self, 'last_push_time'):
+            self.last_push_time = {}
         now = time.time()
         if io in self.last_push_time and now - self.last_push_time[io] < 0.1:
             return
-        self.last_push_time = getattr(self, 'last_push_time', {})
         self.last_push_time[io] = now
         self.led_states[io] = state
         try:
             self.gui_queue.put_nowait((io, state.name))
         except queue.Full:
             logger.warning(f"LED queue full for {io}: Drop")
-        if self.root:
-            self.root.after(0, self._drain_queue_once)
+        # With periodic drain, no need for immediate schedule
+
+    def _sync_initial_leds(self):
+        """Set initial LED states: outputs SOLID, connected inputs BLINK_RAPID, unconnected OFF."""
+        for io in self.outputs:
+            self._queue_led_update(io, LedState.SOLID)
+        for io in self.inputs:
+            state = LedState.BLINK_RAPID if self.inputs[io].get("src") else LedState.OFF
+            self._queue_led_update(io, state)
 
     def get_capabilities(self) -> Dict:
         return {
@@ -164,7 +181,6 @@ class BaseModule:
     def restore_patch(self, data: bytes or Dict):
         if isinstance(data, bytes):
             data = json.loads(data)
-        # No lock: Atomic assigns
         for k, v in data.get("controls", {}).items():
             if k in self.control_ranges:
                 r = self.control_ranges[k]
@@ -175,11 +191,7 @@ class BaseModule:
                 self.inputs[io]["group"] = conn.get("group")
                 if self.inputs[io]["group"]:
                     self._start_receiver(io, self.inputs[io]["group"])
-        for io in self.inputs:
-            state = LedState.SOLID if self.inputs.get(io, {}).get("src") else LedState.OFF
-            self._queue_led_update(io, state)
-        for io in self.outputs:
-            self._queue_led_update(io, LedState.SOLID)
+        self._sync_initial_leds()
         logger.info(f"{self.module_id}: Patch restored")
 
     def handle_msg(self, msg: ProtocolMessage):
