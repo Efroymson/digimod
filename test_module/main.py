@@ -7,6 +7,7 @@ import logging
 import socket
 import struct
 from typing import Dict, List, Tuple
+import queue
 from osc_module import OscModule
 from lfo_module import LfoModule
 from audio_out_module import AudioOutModule
@@ -22,16 +23,14 @@ class MainApp:
         self.root.title("DMS Simulator")
         self.root.geometry("400x300")
         self.modules: Dict[str, 'BaseModule'] = {}
+        self.module_states: Dict[str, Dict] = {}
+        self.saved_patches: Dict[int, Dict[str, Dict]] = {0: {}, 1: {}, 2: {}, 3: {}, 4: {}}
+        self.current_slot = tk.IntVar(value=0)
         self.deferred_modules: List[Tuple[str, str]] = []
         self.viewer: PatchViewer = None
-        self.CV_GROUP = '239.100.1.1'
-        self.sample_patch = {
-            "controls": {"freq": 880.0, "fm_depth": 0.3, "rate": 2.0},
-            "inputs": {"fm": {"src": "lfo_0:cv", "group": self.CV_GROUP}}
-        }
+        self.log_queue = queue.Queue()
         self._setup_gui()
         self._setup_mcu()
-        # No polling - event-driven only
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def _setup_mcu(self):
@@ -48,36 +47,69 @@ class MainApp:
     def _mcu_listener(self):
         while True:
             try:
-                data, _ = self.mcu_sock.recvfrom(1024)
+                data, addr = self.mcu_sock.recvfrom(1024)
                 msg = ProtocolMessage.unpack(data)
-                if msg.type in [ProtocolMessageType.CAPABILITIES_RESPONSE.value, ProtocolMessageType.STATE_RESPONSE.value]:
-                    payload = json.dumps(msg.payload, indent=2)
-                    self.log_text.insert(tk.END, f"Received {ProtocolMessageType(msg.type).name} from {msg.module_id}:\n{payload}\n\n")
+                if msg.type == ProtocolMessageType.CAPABILITIES_RESPONSE.value:
+                    payload_str = json.dumps(msg.payload, indent=2) + "\n\n"
+                    self.log_queue.put(f"Received {ProtocolMessageType(msg.type).name} from {msg.module_id}:\n{payload_str}")
+                elif msg.type == ProtocolMessageType.STATE_RESPONSE.value:
+                    self.module_states[msg.module_id] = msg.payload
+                    payload_str = json.dumps(msg.payload, indent=2) + "\n\n"
+                    self.log_queue.put(f"Received {ProtocolMessageType(msg.type).name} from {msg.module_id}:\n{payload_str}")
                 elif msg.type in [ProtocolMessageType.INITIATE.value, ProtocolMessageType.CONNECT.value, ProtocolMessageType.CANCEL.value]:
-                    self.log_text.insert(tk.END, f"Received {ProtocolMessageType(msg.type).name} from {msg.module_id}:{msg.io_id} (group: {msg.payload.get('group', 'N/A')})\n")
-                self.log_text.see(tk.END)
+                    group = msg.payload.get('group', 'N/A') if isinstance(msg.payload, dict) else 'N/A'
+                    self.log_queue.put(f"Received {ProtocolMessageType(msg.type).name} from {msg.module_id}:{msg.io_id} (group: {group})\n")
             except socket.timeout:
                 pass
             except Exception as e:
                 logger.warning(f"MCU listener error: {e}")
 
     def _setup_gui(self):
+        slot_frame = ttk.Frame(self.root)
+        slot_frame.pack(pady=5)
+        ttk.Label(slot_frame, text="Patch Slot:").pack(side=tk.LEFT)
+        self.slot_scale = ttk.Scale(slot_frame, from_=0, to=4, orient="horizontal",
+                                    variable=self.current_slot, length=100, command=self._snap_slot)
+        self.slot_scale.pack(side=tk.LEFT, padx=5)
+        ttk.Label(slot_frame, textvariable=self.current_slot).pack(side=tk.LEFT, padx=5)
+
         ttk.Button(self.root, text="Add OSC", command=self.add_osc).pack(pady=5)
         ttk.Button(self.root, text="Add LFO", command=self.add_lfo).pack(pady=5)
         ttk.Button(self.root, text="Add Audio Out", command=self.add_audio_out).pack(pady=5)
+        ttk.Button(self.root, text="Auto-Launch Test Rig", command=self.launch_test_rig).pack(pady=5)
         ttk.Button(self.root, text="Inquiry Caps", command=self.inquiry_caps).pack(pady=5)
         ttk.Button(self.root, text="Inquiry State", command=self.inquiry_state).pack(pady=5)
+        ttk.Button(self.root, text="Save Patch", command=self.save_patch).pack(pady=5)
         ttk.Button(self.root, text="Restore Patch", command=self.restore_patch).pack(pady=5)
         ttk.Button(self.root, text="Show Graph", command=self.show_graph).pack(pady=5)
+
         scrollbar = Scrollbar(self.root)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text = Text(self.root, height=15, yscrollcommand=scrollbar.set, wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         scrollbar.config(command=self.log_text.yview)
         self.log_text.insert(tk.END, "DMS Simulator Ready. Add modules to start.\n")
+        # Start log drain
+        self.root.after(50, self._periodic_log_drain)
+
+    def _periodic_log_drain(self):
+        if self.root and self.root.winfo_exists():
+            try:
+                while True:
+                    msg = self.log_queue.get_nowait()
+                    self.log_text.insert(tk.END, msg)
+                self.log_text.see(tk.END)
+            except queue.Empty:
+                pass
+            self.root.after(50, self._periodic_log_drain)
+
+    def _snap_slot(self, val):
+        snapped = round(float(val))
+        self.current_slot.set(snapped)
 
     def add_osc(self):
-        mod_id = f"osc_{len([m for m in self.modules if m.startswith('osc_')])}"
+        count = len([m for m in self.modules if m.startswith('osc_')])
+        mod_id = f"osc_{count}"
         mod = OscModule(mod_id, self.root)
         self.modules[mod_id] = mod
         self.deferred_modules.append((mod_id, "OSC"))
@@ -87,7 +119,8 @@ class MainApp:
         self.log_text.see(tk.END)
 
     def add_lfo(self):
-        mod_id = f"lfo_{len([m for m in self.modules if m.startswith('lfo_')])}"
+        count = len([m for m in self.modules if m.startswith('lfo_')])
+        mod_id = f"lfo_{count}"
         mod = LfoModule(mod_id, self.root)
         self.modules[mod_id] = mod
         self.deferred_modules.append((mod_id, "LFO"))
@@ -97,13 +130,63 @@ class MainApp:
         self.log_text.see(tk.END)
 
     def add_audio_out(self):
-        mod_id = f"audio_out_{len([m for m in self.modules if m.startswith('audio_out_')])}"
+        count = len([m for m in self.modules if m.startswith('audio_out_')])
+        mod_id = f"audio_out_{count}"
         mod = AudioOutModule(mod_id, self.root)
         self.modules[mod_id] = mod
         self.deferred_modules.append((mod_id, "Audio Out"))
         if self.viewer:
             self.viewer.add_module(mod_id, "Audio Out")
         self.log_text.insert(tk.END, f"Added Audio Out {mod_id}\n")
+        self.log_text.see(tk.END)
+
+    def launch_test_rig(self):
+        rig = tk.Toplevel(self.root)
+        rig.title("Test Rig")
+        rig.geometry("1200x800")
+        paned = ttk.PanedWindow(rig, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+
+        # OSC sub-frame
+        osc_sub = ttk.Frame(paned)
+        paned.add(osc_sub, weight=1)
+        ttk.Label(osc_sub, text="OSC Modules").pack()
+        osc_mod_frame = ttk.Frame(osc_sub)
+        osc_mod_frame.pack(fill=tk.BOTH, expand=True)
+        count = len([m for m in self.modules if m.startswith('osc_')])
+        mod_id = f"osc_{count}"
+        mod = OscModule(mod_id, osc_mod_frame)
+        self.modules[mod_id] = mod
+        self.deferred_modules.append((mod_id, "OSC"))
+        self.log_text.insert(tk.END, f"Added OSC {mod_id} to rig\n")
+        self.log_text.see(tk.END)
+
+        # LFO sub-frame
+        lfo_sub = ttk.Frame(paned)
+        paned.add(lfo_sub, weight=1)
+        ttk.Label(lfo_sub, text="LFO Modules").pack()
+        lfo_mod_frame = ttk.Frame(lfo_sub)
+        lfo_mod_frame.pack(fill=tk.BOTH, expand=True)
+        count = len([m for m in self.modules if m.startswith('lfo_')])
+        mod_id = f"lfo_{count}"
+        mod = LfoModule(mod_id, lfo_mod_frame)
+        self.modules[mod_id] = mod
+        self.deferred_modules.append((mod_id, "LFO"))
+        self.log_text.insert(tk.END, f"Added LFO {mod_id} to rig\n")
+        self.log_text.see(tk.END)
+
+        # Audio Out sub-frame
+        audio_sub = ttk.Frame(paned)
+        paned.add(audio_sub, weight=1)
+        ttk.Label(audio_sub, text="Audio Out Modules").pack()
+        audio_mod_frame = ttk.Frame(audio_sub)
+        audio_mod_frame.pack(fill=tk.BOTH, expand=True)
+        count = len([m for m in self.modules if m.startswith('audio_out_')])
+        mod_id = f"audio_out_{count}"
+        mod = AudioOutModule(mod_id, audio_mod_frame)
+        self.modules[mod_id] = mod
+        self.deferred_modules.append((mod_id, "Audio Out"))
+        self.log_text.insert(tk.END, f"Added Audio Out {mod_id} to rig\n")
         self.log_text.see(tk.END)
 
     def inquiry_caps(self):
@@ -118,15 +201,32 @@ class MainApp:
         self.log_text.insert(tk.END, "Broadcast STATE_INQUIRY\n")
         self.log_text.see(tk.END)
 
-    def restore_patch(self):
-        if 'lfo_0' in self.modules:
-            self.sample_patch["inputs"]["fm"]["src"] = "lfo_0:cv"
-        msg = ProtocolMessage(ProtocolMessageType.PATCH_RESTORE.value, "mcu", payload=self.sample_patch)
-        self.mcu_sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
-        self.log_text.insert(tk.END, f"Sent PATCH_RESTORE (src: {self.sample_patch['inputs']['fm']['src']})\n")
+    def save_patch(self):
+        self.inquiry_state()
+        self.root.after(500, self._collect_and_save)
+
+    def _collect_and_save(self):
+        slot = self.current_slot.get()
+        self.saved_patches[slot] = {mid: self.module_states.get(mid, {}) for mid in self.modules}
+        count = len(self.saved_patches[slot])
+        self.log_text.insert(tk.END, f"Saved patch slot {slot} with {count} modules\n")
         self.log_text.see(tk.END)
-        # Explicit sync (no poll)
-        self.root.after(100, lambda: [mod._sync_ui() for mod in self.modules.values()])
+
+    def restore_patch(self):
+        slot = self.current_slot.get()
+        if slot not in self.saved_patches or not self.saved_patches[slot]:
+            self.log_text.insert(tk.END, f"No saved patch in slot {slot}\n")
+            self.log_text.see(tk.END)
+            return
+        restored_count = 0
+        for mod_id, state in self.saved_patches[slot].items():
+            payload = {'target_mod': mod_id, **state}
+            msg = ProtocolMessage(ProtocolMessageType.PATCH_RESTORE.value, "mcu", payload=payload)
+            self.mcu_sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+            self.log_text.insert(tk.END, f"Sent PATCH_RESTORE for {mod_id}\n")
+            restored_count += 1
+        self.log_text.insert(tk.END, f"Multicast restored {restored_count} modules from slot {slot}\n")
+        self.log_text.see(tk.END)
         self.root.after(200, self._update_graph)
 
     def show_graph(self):
@@ -162,3 +262,5 @@ if __name__ == "__main__":
         app.root.mainloop()
     except KeyboardInterrupt:
         app.on_closing()
+
+# main.py ends here

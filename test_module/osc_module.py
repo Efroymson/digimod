@@ -83,10 +83,11 @@ class OscModule(PatchProtocol, ConnectionProtocol, BaseModule):
             pass
 
     def _sync_ui(self):
-        # Silent set (no trace fire)
         self.freq_var.set(self.controls["freq"])
         self.fm_var.set(self.controls["fm_depth"])
-        super()._sync_ui()  # LEDs
+        if self.root:
+            self.root.update_idletasks()  # Force widget refresh
+        super()._sync_ui()
 
     def _start_receiver(self, io, group):
         if io == "fm" and group:

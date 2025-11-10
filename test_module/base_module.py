@@ -164,6 +164,7 @@ class BaseModule:
 
     def get_capabilities(self) -> Dict:
         return {
+            "ip": self.ip,  # Static: Add here for discovery/routing.  In "real harware" also collect MAC address
             "name": self.module_id,
             "type": self.type,
             "controls": [{"id": k, "range": v, "default": self.controls.get(k, v[0] if v else 0)} for k, v in self.control_ranges.items()],
@@ -173,11 +174,11 @@ class BaseModule:
 
     def get_state(self) -> Dict:
         return {
-            "controls": self.controls.copy(),
+            "controls": self.controls.copy(),  # Dynamic only
             "inputs": {k: {"src": v.get("src"), "group": v.get("group")} for k, v in self.inputs.items()},
             "outputs": self.outputs.copy()
         }
-
+        
     def restore_patch(self, data: bytes or Dict):
         if isinstance(data, bytes):
             data = json.loads(data)

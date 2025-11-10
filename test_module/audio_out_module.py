@@ -11,24 +11,21 @@ from base_module import BaseModule, LedState, ProtocolMessage, ProtocolMessageTy
 from connection_protocol import ConnectionProtocol
 from patch_protocol import PatchProtocol
 
-# import sounddevice as sd  # Uncomment for playback + pip install sounddevice
-
 logger = logging.getLogger(__name__)
 
 UDP_AUDIO_PORT = 5005
 SAMPLE_RATE = 48000
 BLOCK_SIZE = 96
 PACKET_SIZE = BLOCK_SIZE * 3
-AUDIO_GROUP_L = '239.100.2.150'
-AUDIO_GROUP_R = '239.100.2.151'
+AUDIO_GROUP = '239.100.2.150'  # Same group for both stereo inputs to match both on INITIATE
 
 class AudioOutModule(PatchProtocol, ConnectionProtocol, BaseModule):
     def __init__(self, mod_id: str, parent_root: tk.Tk = None):
         super().__init__(mod_id, "audio_out")
         self.control_ranges = {}
         self.controls = {}
-        self.inputs = {"left": {"type": "audio", "group": AUDIO_GROUP_L, "src": None},
-                       "right": {"type": "audio", "group": AUDIO_GROUP_R, "src": None}}
+        self.inputs = {"left": {"type": "audio", "group": AUDIO_GROUP, "src": None},
+                       "right": {"type": "audio", "group": AUDIO_GROUP, "src": None}}
         self.outputs = {}
         self.led_states = {"left": LedState.OFF, "right": LedState.OFF}
         self.left_q = queue.Queue(maxsize=10)
@@ -37,14 +34,15 @@ class AudioOutModule(PatchProtocol, ConnectionProtocol, BaseModule):
         self._right_receiver = None
         self._setup_gui(parent_root)
         self.set_root(self.root)
-        # self.stream = sd.OutputStream(samplerate=SAMPLE_RATE, channels=2, dtype='int32', blocksize=BLOCK_SIZE, callback=self._audio_callback)
-        # self.stream.start()
+        self._sync_initial_leds()
 
     def _setup_gui(self, parent_root):
         self.root = tk.Toplevel(parent_root) if parent_root else tk.Tk()
         self.root.title(f"Audio Out {self.module_id}")
         ttk.Button(self.root, text="Left Input", command=lambda: self.connect_input("left")).pack(pady=5)
+        ttk.Button(self.root, text="Long Press Left", command=lambda: self.long_press_input("left")).pack(pady=5)
         ttk.Button(self.root, text="Right Input", command=lambda: self.connect_input("right")).pack(pady=5)
+        ttk.Button(self.root, text="Long Press Right", command=lambda: self.long_press_input("right")).pack(pady=5)
         self.gui_leds["left"] = tk.Label(self.root, text="Left LED", bg="gray", width=10, height=1)
         self.gui_leds["left"].pack(pady=2)
         self.gui_leds["right"] = tk.Label(self.root, text="Right LED", bg="gray", width=10, height=1)
@@ -52,7 +50,7 @@ class AudioOutModule(PatchProtocol, ConnectionProtocol, BaseModule):
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def _sync_ui(self):
-        super()._sync_ui()  # Only LEDs (no sliders)
+        super()._sync_ui()
 
     def _start_receiver(self, io, group):
         if not group:
@@ -66,7 +64,6 @@ class AudioOutModule(PatchProtocol, ConnectionProtocol, BaseModule):
         new_thread.start()
         setattr(self, key, new_thread)
 
-    # In _receiver_stub (~L80): Robust timeout/full
     def _receiver_stub(self, group, q, io_id):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -74,7 +71,7 @@ class AudioOutModule(PatchProtocol, ConnectionProtocol, BaseModule):
         sock.bind(('', UDP_AUDIO_PORT))
         mreq = struct.pack("4sl", socket.inet_aton(group), socket.INADDR_ANY)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-        sock.settimeout(0.1)  # Longer for sim jitter
+        sock.settimeout(0.1)
         drop_count = 0
         while True:
             try:
@@ -87,30 +84,28 @@ class AudioOutModule(PatchProtocol, ConnectionProtocol, BaseModule):
                     logger.debug(f"Short packet for {io_id}: {len(data)} bytes")
             except socket.timeout:
                 drop_count += 1
-                if drop_count % 100 == 0:  # Log every ~10s
+                if drop_count % 100 == 0:
                     logger.warning(f"{io_id} receiver timeout spam: {drop_count}")
-                continue  # No zeros push
+                continue
             except queue.Full:
                 logger.warning(f"{io_id} queue full: Drop block")
                 drop_count += 1
-                continue  # No raise/block
+                continue
             except Exception as e:
                 logger.warning(f"{io_id} receiver error: {e}")
                 drop_count += 1
 
-    # def _audio_callback(self, outdata, frames, time, status):
-    #     left = self.left_q.get() if not self.left_q.empty() else np.zeros(frames, dtype=np.int32)
-    #     right = self.right_q.get() if not self.right_q.empty() else np.zeros(frames, dtype=np.int32)
-    #     outdata[:, 0] = left[:frames]
-    #     outdata[:, 1] = right[:frames]
+    def _unpack_sample(self, bytes_data):
+        # Unpack 24-bit little-endian to int32
+        val = (bytes_data[2] << 16) | (bytes_data[1] << 8) | bytes_data[0]
+        if val & 0x800000:
+            val -= 0x1000000
+        return val
 
     def on_closing(self):
-        # self.stream.stop()
-        # self.stream.close()
         super().on_closing()
         if self.root:
             self.root.destroy()
 
     def handle_msg(self, msg: ProtocolMessage):
-        # No lock: Atomic
-        super().handle_msg(msg)  # Chain
+        super().handle_msg(msg)
