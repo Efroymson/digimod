@@ -167,11 +167,27 @@ class MainApp:
         self.root.after(500, self._refresh_all_modules)
 
     def save_patch(self):
-        self.saved_states.clear()
-        self._log("Starting export to file: Discovering modules...")
-        cap_msg = ProtocolMessage(ProtocolMessageType.CAPABILITIES_INQUIRY.value, "mcu")
-        self.sock.sendto(cap_msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
-        self.root.after(1000, self._send_state_inquiry_for_file)
+        self.collected_states = {}
+        msg = ProtocolMessage(ProtocolMessageType.STATE_INQUIRY.value, "mcu")
+        self.mcu_sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+        self.log_text.insert(tk.END, "Broadcast STATE_INQUIRY\n")
+        self.log_text.see(tk.END)
+
+        # Collect responses with timeout
+        def collect_responses():
+            self.root.after(500, self._check_states_collected)  # 500ms timeout
+
+        self.root.after(100, collect_responses)
+
+    def _check_states_collected(self):
+        if len(self.collected_states) == 0:
+            # Popup error
+            from tkinter import messagebox
+            messagebox.showerror("Save Failed", "No module states received. Ensure modules are running and responsive.")
+            return
+        # Save to file or whatever — for now, log
+        self.log_text.insert(tk.END, f"Saved {len(self.collected_states)} states\n")
+        self.log_text.see(tk.END)
 
     def _send_state_inquiry_for_file(self):
         self._log("Requesting state from all modules...")
@@ -228,6 +244,27 @@ class MainApp:
             if hasattr(mod, '_refresh_all_widgets'):
                 mod._refresh_all_widgets()
         self._log("Refreshed all module GUIs")
+        
+    def _mcu_listener(self):
+        while True:
+            try:
+                data, _ = self.mcu_sock.recvfrom(1024)
+                msg = ProtocolMessage.unpack(data)
+                if msg.type == ProtocolMessageType.STATE_RESPONSE.value:
+                    mod_id = msg.module_id
+                    state = msg.payload  # Assume modules send get_state() as payload
+                    self.collected_states[mod_id] = state
+                    self.log_text.insert(tk.END, f"Collected state from {mod_id}\n")
+                elif msg.type == ProtocolMessageType.CAPABILITIES_RESPONSE.value:
+                    # Your existing log
+                    payload = json.dumps(msg.payload, indent=2)
+                    self.log_text.insert(tk.END, f"Received {ProtocolMessageType(msg.type).name} from {msg.module_id}:\n{payload}\n\n")
+                # ... other logs
+                self.log_text.see(tk.END)
+            except socket.timeout:
+                pass
+            except Exception as e:
+                logger.warning(f"MCU listener error: {e}")
 
     def on_closing(self):
         if messagebox.askokcancel("Quit", "Close DMS Control Panel?"):

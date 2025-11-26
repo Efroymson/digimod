@@ -16,6 +16,14 @@ CONTROL_MULTICAST = '239.50.0.1'
 UDP_CONTROL_PORT = 5004
 RECV_TIMEOUT = 0.1
 
+class ConnectionRecord:
+    def __init__(self, src: str, mcast_group: str, block_offset: int, block_size: int):
+        self.src = src
+        self.mcast_group = mcast_group
+        self.block_offset = block_offset
+        self.block_size = block_size
+        
+        
 class LedState(Enum):
     OFF = 0
     BLINK_SLOW = 1
@@ -209,7 +217,23 @@ class BaseModule:
         }
 
     def handle_msg(self, msg: ProtocolMessage):
-        pass
+        # Only respond to explicit MCU inquiries
+        if msg.type == ProtocolMessageType.CAPABILITIES_INQUIRY.value and msg.module_id == "mcu":
+            caps = self.get_capabilities()
+            resp = ProtocolMessage(
+                ProtocolMessageType.CAPABILITIES_RESPONSE.value,
+                self.module_id,
+                payload=caps
+            )
+            self.sock.sendto(resp.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+            logger.info(f"[{self.module_id}] Responded to CAPABILITIES_INQUIRY")
+
+        elif msg.type == ProtocolMessageType.STATE_INQUIRY.value and msg.module_id == "mcu":
+            # PatchProtocol handles STATE_RESPONSE
+            pass  # Let PatchProtocol's handle_msg see it
+
+        # Let subclasses (ConnectionProtocol, PatchProtocol) see all messages
+        # No super() needed — we're the base
 
     def on_closing(self):
         try:

@@ -12,7 +12,7 @@ import struct
 import logging
 
 from base_module import BaseModule, LedState, ProtocolMessage, ProtocolMessageType, CONTROL_MULTICAST, UDP_CONTROL_PORT, JackWidget
-from connection_protocol import ConnectionProtocol
+from connection_protocol import ConnectionProtocol, InputState, OutputState
 from patch_protocol import PatchProtocol
 
 logger = logging.getLogger(__name__)
@@ -24,10 +24,14 @@ CV_GROUP = '239.100.1.1'
 AUDIO_GROUP = '239.100.2.150'
 HYSTERESIS = 0.01
 
+
+    
 class OscModule(ConnectionProtocol, PatchProtocol, BaseModule):
     def __init__(self, mod_id: str, parent_root: tk.Tk = None):
-        super().__init__(mod_id, "osc")  # This calls ConnectionProtocol → PatchProtocol → BaseModule
+        # 1. First: BaseModule — sets up socket, ID, multicast group, etc.
+        super().__init__(mod_id, "osc")
 
+        # 2. Define I/O and controls — AFTER super() so ConnectionProtocol sees them
         self.inputs = {"fm": {"type": "cv", "group": CV_GROUP}}
         self.outputs = {"audio": {"type": "audio", "group": self.mcast_group}}
         self.control_ranges = {"freq": [20, 20000], "fm_depth": [0, 1]}
@@ -43,16 +47,21 @@ class OscModule(ConnectionProtocol, PatchProtocol, BaseModule):
         self._audio_thread = None
         self.controls_lock = threading.Lock()
 
+        # 3. Initialize connection states (must come after inputs/outputs defined)
         self._init_connection_states()
+        self._sync_initial_leds()
+
+        # 4. Build GUI
         self._setup_gui(parent_root)
         self.set_root(self.root)
-        self._sync_initial_leds()
-        self._update_display()
-        if self.root:
-            self.root.update_idletasks()
 
+        # 5. Final GUI refresh (protects pending states + shows correct LEDs on restore)
+        if hasattr(self, "_refresh_gui_from_controls"):
+            self._refresh_gui_from_controls()
+
+        # 6. Start audio
         self.start_sending()
-
+        
     def _setup_gui(self, parent_root):
         self.root = tk.Toplevel(parent_root) if parent_root else tk.Tk()
         self.root.title(f"Osc {self.module_id}")
@@ -172,14 +181,18 @@ class OscModule(ConnectionProtocol, PatchProtocol, BaseModule):
         self.freq_var.set(self.controls.get("freq", 440.0))
         self.fm_var.set(self.controls.get("fm_depth", 0.5))
 
+        # PROTECT PENDING STATES: Only refresh connected/disconnected, skip IPending/ISelfCompatible
         for io_id, rec in getattr(self, "input_connections", {}).items():
-            state = "IIdleConnected" if rec else "IIdleDisconnected"
+            if self.input_states.get(io_id) in (InputState.IPending, InputState.ISelfCompatible):
+                continue  # Don't overwrite pending visuals
+            state_str = "IIdleConnected" if rec else "IIdleDisconnected"
             led = LedState.BLINK_RAPID if rec else LedState.OFF
-            self.input_states[io_id] = state
+            self.input_states[io_id] = state_str  # Enum string for compatibility
             self._queue_led_update(io_id, led)
 
-        for io_id in self.output_states:
-            self._queue_led_update(io_id, LedState.SOLID)
+        for io_id in self.outputs:
+            if self.output_states.get(io_id) not in (OutputState.OSelfPending, OutputState.OCompatible):
+                self._queue_led_update(io_id, LedState.SOLID)  # Protect pending outputs too
 
         if self.root:
             self.root.update_idletasks()
