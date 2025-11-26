@@ -16,14 +16,16 @@ class OutputState(Enum):
     OCompatible = auto()
     ONotCompatible = auto()
 
+
 class InputState(Enum):
     IIdleDisconnected = auto()
-    ISelfCompatible = auto()
-    IPending = auto()
+    ISelfCompatible = auto()      # after short-press on an input (COMPATIBLE sent)
+    IPending = auto()             # compatible INITIATE received
     IIdleConnected = auto()
-    IOtherPending = auto()
-    IPendingSame = auto()
-
+    IOtherPending = auto()        # incompatible INITIATE received while pending
+    IPendingSame = auto()         # repeated INITIATE from same source
+    IOtherCompatible = auto()     # another input went into ISelfCompatible (we dim)
+    
 class ConnectionProtocol:
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -92,36 +94,46 @@ class ConnectionProtocol:
         super().handle_msg(msg)  # Let PatchProtocol see PATCH_RESTORE
 
     def _handle_initiate(self, msg: ProtocolMessage):
-        if msg.module_id == self.module_id:
+        if msg.module_id == self.module_id:      # ignore our own messages
             return
 
         payload = msg.payload or {}
-        group = payload.get("group")
-        io_type = payload.get("type")
+        src_type = payload.get("type", "unknown")
 
-        self.pending_initiator = (msg.module_id, msg.io_id, payload)
-
-        # Update inputs per CSV: compatible → IPending (SOLID), else IOtherPending (OFF)
+        # ------------------------------------------------------------------
+        # 1. INPUT side – do we become PENDING?
+        # ------------------------------------------------------------------
         for io_id, info in self.inputs.items():
-            compatible = (info.get("type") == io_type and info.get("group") == group)
-            current = self.input_states[io_id]
-            if compatible:
-                if current in (InputState.IIdleDisconnected, InputState.ISelfCompatible):
+            my_type = info.get("type", "unknown")
+
+            if my_type == src_type:
+                # compatible → go/remain PENDING
+                if self.input_states[io_id] in (InputState.IIdleDisconnected,
+                                                InputState.IOtherCompatible,
+                                                InputState.IOtherPending):
                     self.input_states[io_id] = InputState.IPending
-                    self._queue_led_update(io_id, LedState.SOLID)
-                elif current == InputState.IIdleConnected:
-                    pass  # Temporarily OFF for celebration (CSV note)
+                    self.pending_initiator = (msg.module_id, msg.io_id, payload)
+                    self._queue_led_update(io_id, LedState.SOLID)   # white = ready
+                    logger.info(f"[{self.module_id}] Input {io_id} → PENDING from {msg.module_id}:{msg.io_id}")
             else:
-                if current in (InputState.IIdleDisconnected, InputState.IPending, InputState.ISelfCompatible):
+                # incompatible → dim if we were pending
+                if self.input_states[io_id] == InputState.IPending:
                     self.input_states[io_id] = InputState.IOtherPending
                     self._queue_led_update(io_id, LedState.OFF)
 
-        # Update outputs: all non-self to OOtherPending (OFF)
+        # ------------------------------------------------------------------
+        # 2. OUTPUT side – dim everything except the initiator
+        # ------------------------------------------------------------------
         for io_id in self.outputs:
-            if self.output_states[io_id] == OutputState.OIdle:
-                self.output_states[io_id] = OutputState.OOtherPending
-                self._queue_led_update(io_id, LedState.OFF)
-
+            if (msg.module_id, msg.io_id) != (self.module_id, io_id):  # not ourselves
+                my_type = self.outputs[io_id].get("type", "unknown")
+                if my_type != src_type:
+                    self.output_states[io_id] = OutputState.ONotCompatible
+                    self._queue_led_update(io_id, LedState.OFF)
+                else:
+                    self.output_states[io_id] = OutputState.OOtherPending
+                    self._queue_led_update(io_id, LedState.OFF)
+                    
     def _handle_compatible(self, msg: ProtocolMessage):
         # Response to COMPATIBLE: Check if our outputs match the input's type/group
         if msg.module_id == self.module_id:
@@ -167,61 +179,57 @@ class ConnectionProtocol:
         self.root.after(600, lambda: self._queue_led_update(io_id, LedState.SOLID))
 
     # User Actions
-    def initiate_connect(self, io_id: str):  # Output short press
-        state = self.output_states.get(io_id, OutputState.OIdle)
-        if state == OutputState.OSelfPending:
-            # CSV: Send CANCEL, back to OIdle
-            cancel_msg = ProtocolMessage(ProtocolMessageType.CANCEL.value, self.module_id)
-            self.sock.sendto(cancel_msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
-            self._revert_all_pending()
+    def initiate_connect(self, io_id: str):
+        if self.output_states.get(io_id) not in (OutputState.OIdle, OutputState.OCompatible):
             return
-        if state not in (OutputState.OIdle, OutputState.OCompatible):
-            return  # Ignore if not valid (e.g., OOtherPending)
 
         info = self.outputs[io_id]
-        payload = {"group": info.get("group", self.mcast_group), "type": info.get("type", "unknown"), "offset": 0, "block_size": 96}
-        msg = ProtocolMessage(ProtocolMessageType.INITIATE.value, self.module_id, self.type, io_id, payload)
+        payload = {
+            "group": info.get("group", self.mcast_group),
+            "type": info.get("type", "unknown"),
+            "offset": 0,
+            "block_size": 96
+        }
+        msg = ProtocolMessage(ProtocolMessageType.INITIATE.value,
+                              self.module_id, self.type, io_id, payload)
         self.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
 
         self.output_states[io_id] = OutputState.OSelfPending
         self._queue_led_update(io_id, LedState.BLINK_SLOW)
-        logger.info(f"[{self.module_id}] INITIATE from {io_id}")
-
-    def connect_input(self, io_id: str):  # Input short press
+        logger.info(f"[{self.module_id}] INITIATE sent from {io_id}")
+        
+        
+    def connect_input(self, io_id: str):
         state = self.input_states.get(io_id)
-        if state == InputState.ISelfCompatible:
-            # Enter initiate_compatible: slow blink this input, dim incompatible outputs
-            self.compatible_input = io_id
-            self.input_states[io_id] = InputState.ISelfCompatible
-            self._queue_led_update(io_id, LedState.BLINK_SLOW)
-            info = self.inputs[io_id]
-            payload = {"group": info.get("group", ""), "type": info.get("type", "unknown")}
-            msg = ProtocolMessage(ProtocolMessageType.COMPATIBLE.value, self.module_id, self.type, io_id, payload)
-            self.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
-            logger.info(f"[{self.module_id}] COMPATIBLE from input {io_id}")
+        if state not in (InputState.IPending, InputState.ISelfCompatible):
             return
-        if state != InputState.IPending or not self.pending_initiator:
-            return  # Not ready to connect
 
-        # Complete connection per CSV
+        if not self.pending_initiator:
+            return
+
         src_mod, src_io, payload = self.pending_initiator
         group = payload.get("group")
         offset = payload.get("offset", 0)
         block_size = payload.get("block_size", 96)
         rec = ConnectionRecord(f"{src_mod}:{src_io}", group, offset, block_size)
         self.input_connections[io_id] = rec
-        self.input_states[io_id] = InputState.IIdleConnected  # To IPendingSame if repeat, but simplify
+        self.input_states[io_id] = InputState.IIdleConnected
         self._queue_led_update(io_id, LedState.BLINK_RAPID)
         self._start_receiver(io_id, group, offset, block_size)
 
+        # Tell the SOURCE that connection succeeded
         connect_msg = ProtocolMessage(ProtocolMessageType.CONNECT.value, src_mod, io_id=src_io)
         self.sock.sendto(connect_msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
 
-        cancel_msg = ProtocolMessage(ProtocolMessageType.CANCEL.value, self.module_id)
-        self.sock.sendto(cancel_msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
-        self._revert_all_pending()
-        logger.info(f"[{self.module_id}] Connected {io_id} ← {src_mod}:{src_io}")
+        # Only the initiator should clean up
+        if self.pending_initiator:
+            cancel_msg = ProtocolMessage(ProtocolMessageType.CANCEL.value, src_mod)  # Cancel from source
+            self.sock.sendto(cancel_msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
 
+        self.pending_initiator = None
+        logger.info(f"[{self.module_id}] Connected {io_id} ← {src_mod}:{src_io}")
+        
+        
     def long_press_input(self, io_id: str):  # Disconnect connected input
         if self.input_states.get(io_id) != InputState.IIdleConnected:
             return
