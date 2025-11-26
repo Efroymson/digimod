@@ -221,11 +221,7 @@ class ConnectionProtocol:
         connect_msg = ProtocolMessage(ProtocolMessageType.CONNECT.value, src_mod, io_id=src_io)
         self.sock.sendto(connect_msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
 
-        # Only the initiator should clean up
-        if self.pending_initiator:
-            cancel_msg = ProtocolMessage(ProtocolMessageType.CANCEL.value, src_mod)  # Cancel from source
-            self.sock.sendto(cancel_msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
-
+    
         self.pending_initiator = None
         logger.info(f"[{self.module_id}] Connected {io_id} ← {src_mod}:{src_io}")
         
