@@ -83,21 +83,22 @@ class OutputJack:
         logger.info(f"[{self.module.module_id}] INITIATE sent from {self.io_id}")
 
     def on_initiate(self, msg: ProtocolMessage):
+        # Ignore our own INITIATE message
         if msg.module_id == self.module.module_id and msg.io_id == self.io_id:
-            return  # ignore self
-        payload = msg.payload or {}
-        src_type = payload.get("type", "unknown")
-        my_type = self.module.outputs[self.io_id].get("type", "unknown")
+            return
 
+        # If we are the one trying to initiate, and another output beat us,
+        # yield to the one with lower module_id (tie-breaker)
         if self.state == OutputState.OSelfPending:
-            # race condition: another output is trying to initiate
-            # lower IP wins → we yield
             if msg.module_id < self.module.module_id:
                 self.state = OutputState.OOtherPending
-        elif my_type == src_type:
-            self.state = OutputState.OCompatible if self.state == OutputState.OIdle else self.state
-        else:
-            self.state = OutputState.ONotCompatible
+                self._set_led()
+            return  # done — we yielded
+
+        # For all other cases: another output has initiated
+        # → ALL non-initiating outputs go dark
+        # No type checking. Ever.
+        self.state = OutputState.OOtherPending
         self._set_led()
 
     def on_cancel(self, msg: ProtocolMessage):
