@@ -37,8 +37,12 @@ class OscModule(ConnectionProtocol, PatchProtocol, BaseModule):
         self.control_ranges = {"freq": [20, 20000], "fm_depth": [0, 1]}
         self.controls = {"freq": 440.0, "fm_depth": 0.5}
 
-        self.freq_var = tk.DoubleVar(value=440.0)
-        self.fm_var = tk.DoubleVar(value=0.5)
+        self.control_vars = {}
+        self.freq_var = tk.DoubleVar()
+        self.control_vars["freq"] = self.freq_var
+
+        self.fm_var = tk.DoubleVar()
+        self.control_vars["fm_depth"] = self.fm_var
 
         self.cv_buffer = np.zeros(1024, dtype=np.float32)
         self.cv_phase = 0

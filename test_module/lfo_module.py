@@ -32,7 +32,10 @@ class LfoModule(ConnectionProtocol, PatchProtocol, BaseModule):
 
         self.phase = 0.0
         self._cv_thread = None
+        self.control_vars = {}
         self.rate_var = tk.DoubleVar(value=1.0)
+        self.control_vars["rate"] = self.rate_var
+        
 
         # 3. Initialize connection states (must come after inputs/outputs defined)
         # self._init_connection_states()
