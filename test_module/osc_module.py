@@ -51,6 +51,7 @@ class OscModule(ConnectionProtocol, PatchProtocol, BaseModule):
         # self._init_connection_states()
         # self._sync_initial_leds()
         self._ensure_io_defs()          # ← NEW
+        self._refresh_gui_from_controls()   # ← now comes from ConnectionProtocol
 
         # 4. Build GUI
         self._setup_gui(parent_root)
@@ -156,6 +157,8 @@ class OscModule(ConnectionProtocol, PatchProtocol, BaseModule):
         def receiver():
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, 'SO_REUSEPORT'):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             sock.bind(('', UDP_AUDIO_PORT))
             mreq = struct.pack("4sl", socket.inet_aton(group), socket.INADDR_ANY)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)

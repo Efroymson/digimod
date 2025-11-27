@@ -116,6 +116,21 @@ class OutputJack:
                     lambda on=on: self.module._queue_led_update(self.io_id,
                         LedState.BLINK_RAPID if on else LedState.OFF))
             self.module.root.after(600, lambda: self._set_led())
+    
+    def on_compatible(self, msg: ProtocolMessage):
+        # Ignore our own COMPATIBLE message
+        if msg.module_id == self.module.module_id and msg.io_id == self.io_id:
+            return
+
+        payload = msg.payload or {}
+        requested_type = payload.get("type", "unknown")
+        my_type = self.module.outputs[self.io_id].get("type", "unknown")
+
+        if my_type == requested_type:
+            self.state = OutputState.OCompatible
+        else:
+            self.state = OutputState.ONotCompatible
+        self._set_led()
 
 # ===================================================================
 # INPUT JACK STATE MACHINE
@@ -142,14 +157,15 @@ class InputJack:
         self.module._queue_led_update(self.io_id, mapping[self.state])
 
     def short_press(self):
-        if self.state == InputState.IIdleDisconnected:
-            self._send_compatible()
-            self.state = InputState.ISelfCompatible
-            self.module._notify_self_compatible(self.io_id)
-        elif self.state == InputState.IPending:
-            self._accept_connection()
-        # else: ignore
-        self._set_led()
+            if self.state == InputState.IIdleDisconnected:
+                self._send_compatible()
+                self.state = InputState.ISelfCompatible
+                self.module._notify_self_compatible(self.io_id)
+            elif self.state == InputState.IIdleConnected:
+                self._send_reveal()
+            elif self.state == InputState.IPending:
+                self._accept_connection()
+            self._set_led()
 
     def long_press(self):
         if self.state == InputState.IIdleConnected:
@@ -167,6 +183,18 @@ class InputJack:
             self.module.module_id, self.module.type, self.io_id, payload
         )
         self.module.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+    
+    def _send_reveal(self):
+            rec = self.module.input_connections.get(self.io_id)
+            if not rec:
+                return
+            payload = {"src": rec.src}
+            msg = ProtocolMessage(
+                ProtocolMessageType.SHOW_CONNECTED.value,
+                self.module.module_id, self.module.type, self.io_id, payload
+            )
+            self.module.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+            logger.info(f"[{self.module.module_id}] REVEAL sent for {self.io_id} → {rec.src}")
 
     def _accept_connection(self):
         if not self.pending_initiator:
@@ -227,11 +255,20 @@ class InputJack:
             self._set_led()
 
     def on_compatible(self, msg: ProtocolMessage):
-        if msg.io_id == self.io_id and msg.module_id == self.module.module_id:
+        if msg.module_id == self.module.module_id and msg.io_id == self.io_id:
             return  # ignore self
-        if self.state == InputState.IIdleDisconnected:
-            self.state = InputState.IOtherCompatible
-            self._set_led()
+
+        payload = msg.payload or {}
+        src_type = payload.get("type", "unknown")
+        my_type = self.module.outputs[self.io_id].get("type", "unknown")
+
+        if my_type == src_type:
+            self.state = OutputState.OCompatible
+            logger.info(f"[{self.module.module_id}] Output {self.io_id} → OCompatible (matched {src_type})")
+        else:
+            self.state = OutputState.ONotCompatible
+            logger.info(f"[{self.module.module_id}] Output {self.io_id} → ONotCompatible (wanted {src_type}, got {my_type})")
+        self._set_led()
 
 # ===================================================================
 # MAIN CONNECTION PROTOCOL CLASS
@@ -296,8 +333,9 @@ class ConnectionProtocol:
             for jack in self.output_jacks.values():
                 jack.on_cancel(msg)
         elif msg.type == ProtocolMessageType.COMPATIBLE.value:
-            for jack in self.input_jacks.values():
+            for jack in self.output_jacks.values():
                 jack.on_compatible(msg)
+            return  # ← stop here
         elif msg.type == ProtocolMessageType.CONNECT.value:
             pass  # ignored — only for debugging
         elif msg.type == ProtocolMessageType.STATE_INQUIRY.value:
@@ -373,3 +411,6 @@ class ConnectionProtocol:
                 "controls": self.controls.copy(),
                 "connections": connections
             }
+            
+    def _stop_receiver(self, io_id: str):
+            pass
