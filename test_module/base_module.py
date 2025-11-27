@@ -17,12 +17,12 @@ UDP_CONTROL_PORT = 5004
 RECV_TIMEOUT = 0.1
 
 class ConnectionRecord:
-    def __init__(self, src: str, mcast_group: str, block_offset: int, block_size: int):
-        self.src = src
+    def __init__(self, src: str, src_io: str, mcast_group: str, block_offset: int, block_size: int):
+        self.src = src                  # e.g. "lfo_0"
+        self.src_io = src_io            # e.g. "cv" or "audio"
         self.mcast_group = mcast_group
         self.block_offset = block_offset
         self.block_size = block_size
-        
         
 class LedState(Enum):
     OFF = 0

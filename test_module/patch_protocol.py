@@ -72,4 +72,69 @@ class PatchProtocol:
 
         # 4. ONE AND ONLY ONE CALL — universal, correct, safe
         if self.root:
-            self.root.after(50, self._refresh_gui_from_controls)
+            self._refresh_gui_from_controls()   # ← call directly, not after()            
+    def _refresh_gui_from_controls(self):
+        """
+        Universal restore method — works for every module type.
+        Called on module creation and on patch restore.
+        """
+        # ── 1. Restore control values (sliders/knobs) ───────────────────────
+        # All modules have self.controls and self.control_vars (or similar)
+        control_vars = getattr(self, "control_vars", {})
+        for ctrl_id, var in control_vars.items():
+            if ctrl_id in self.controls:
+                # This triggers Tkinter variable → GUI update
+                var.set(self.controls[ctrl_id])
+
+        # ── 2. Restore connection LEDs (respect pending states) ─────────────
+        # INPUTS
+        for io_id, jack in self.input_jacks.items():
+            rec = self.input_connections.get(io_id)
+            if rec:
+                # Connected → BLINK_RAPID, but don't override active pending modes
+                if jack.state not in (
+                    InputState.IPending,
+                    InputState.IPendingSame,
+                    InputState.ISelfCompatible,
+                    InputState.IOtherCompatible,
+                    InputState.IOtherPending
+                ):
+                    self._queue_led_update(io_id, LedState.BLINK_RAPID)
+            else:
+                # Disconnected → OFF, unless pending/compatible
+                if jack.state not in (
+                    InputState.IPending,
+                    InputState.IPendingSame,
+                    InputState.ISelfCompatible,
+                    InputState.IOtherCompatible
+                ):
+                    self._queue_led_update(io_id, LedState.OFF)
+
+        # OUTPUTS
+        for io_id, jack in self.output_jacks.items():
+            if jack.state in (OutputState.OIdle, OutputState.OCompatible):
+                self._queue_led_update(io_id, LedState.SOLID)
+            # OSelfPending → leave blinking (correct)
+            # OOtherPending / ONotCompatible → leave OFF (correct)
+        # Force Tkinter to update all widgets immediately
+        if hasattr(self, "root") and self.root:
+            self.root.update_idletasks()
+            
+    def get_state(self) -> Dict:
+            """Return current module state for patch save"""
+            connections = {}
+            for io_id, rec in self.input_connections.items():
+                if rec:
+                    connections[io_id] = {
+                        "src": rec.src,
+                        "group": rec.mcast_group,
+                        "offset": rec.block_offset,
+                        "block_size": rec.block_size,
+                    }
+            return {
+                "controls": self.controls.copy(),
+                "connections": connections
+            }
+            
+    def _stop_receiver(self, io_id: str):
+            pass

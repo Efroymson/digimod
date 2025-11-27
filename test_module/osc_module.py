@@ -55,11 +55,11 @@ class OscModule(ConnectionProtocol, PatchProtocol, BaseModule):
         # self._init_connection_states()
         # self._sync_initial_leds()
         self._ensure_io_defs()          # ← NEW
-        self._refresh_gui_from_controls()   # ← now comes from ConnectionProtocol
 
         # 4. Build GUI
         self._setup_gui(parent_root)
         self.set_root(self.root)
+        self._refresh_gui_from_controls()   # ← now comes from PatchProtocol
 
         # 5. Final GUI refresh (protects pending states + shows correct LEDs on restore)
         if hasattr(self, "_refresh_gui_from_controls"):
@@ -100,6 +100,7 @@ class OscModule(ConnectionProtocol, PatchProtocol, BaseModule):
             if abs(f - self.controls["freq"]) >= HYSTERESIS:
                 with self.controls_lock:
                     self.controls["freq"] = f
+                    self.freq_var.set(f)   # ← THIS LINE IS REQUIRED
         except ValueError:
             pass
 
@@ -109,6 +110,7 @@ class OscModule(ConnectionProtocol, PatchProtocol, BaseModule):
             if abs(f - self.controls["fm_depth"]) >= HYSTERESIS:
                 with self.controls_lock:
                     self.controls["fm_depth"] = f
+                    self.fm_var.set(f)   # ← THIS LINE IS REQUIRED
         except ValueError:
             pass
 

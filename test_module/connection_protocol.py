@@ -131,6 +131,25 @@ class OutputJack:
         else:
             self.state = OutputState.ONotCompatible
         self._set_led()
+        
+    def on_show_connected(self, msg: ProtocolMessage):
+        """REVEAL: Flash rapidly for 3s if this output is the connected source"""
+        payload = msg.payload or {}
+        if payload.get("src") == self.module.module_id and payload.get("src_io") == self.io_id:
+            logger.info(f"[{self.module.module_id}] REVEAL → flashing {self.io_id} for 3s")
+            self._flash_rapid_3s()
+
+    def _flash_rapid_3s(self):
+        """Temporarily override LED to rapid blink for 3 seconds"""
+        original_state = self.state
+        self.module._queue_led_update(self.io_id, LedState.BLINK_RAPID)
+
+        def revert():
+            if hasattr(self.module, "root") and self.module.root and self.module.root.winfo_exists():
+                self._set_led()
+
+        if hasattr(self.module, "root") and self.module.root:
+            self.module.root.after(3000, revert)
 
 # ===================================================================
 # INPUT JACK STATE MACHINE
@@ -162,9 +181,42 @@ class InputJack:
                 self.state = InputState.ISelfCompatible
                 self.module._notify_self_compatible(self.io_id)
             elif self.state == InputState.IIdleConnected:
-                self._send_reveal()
+                        rec = self.module.input_connections.get(self.io_id)
+                        if rec:
+                            payload = {
+                                "src": rec.src,
+                                "src_io": rec.src_io
+                            }
+                            msg = ProtocolMessage(
+                                ProtocolMessageType.SHOW_CONNECTED.value,
+                                self.module.module_id,
+                                self.module.type,
+                                self.io_id,
+                                payload
+                            )
+                            self.module.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+                            logger.info(f"[{self.module.module_id}] Sent SHOW_CONNECTED → {rec.src}:{rec.src_io}")
+                        return
             elif self.state == InputState.IPending:
-                self._accept_connection()
+                if not self.pending_initiator:
+                    logger.warning(f"[{self.module.module_id}] No pending initiator for {self.io_id}")
+                    return
+
+                src_module, src_io = self.pending_initiator
+
+                rec = ConnectionRecord(
+                    src=src_module,
+                    src_io=src_io,                                   # This is now correct
+                    mcast_group=self.module.mcast_group,            # safe for LFO/Osc
+                    block_offset=0,
+                    block_size=96,
+                )
+                self.module.input_connections[self.io_id] = rec
+                self.module._start_receiver(self.io_id, rec.mcast_group, rec.block_offset, rec.block_size)
+                self.state = InputState.IIdleConnected
+                self.pending_initiator = None
+                self._set_led()
+                logger.info(f"[{self.module.module_id}] Connected {self.io_id} ← {src_module}:{src_io}")
             self._set_led()
 
     def long_press(self):
@@ -203,7 +255,13 @@ class InputJack:
         group = payload.get("group")
         offset = payload.get("offset", 0)
         block_size = payload.get("block_size", 96)
-        rec = ConnectionRecord(f"{src_mod}:{src_io}", group, offset, block_size)
+        rec = ConnectionRecord(
+            src="temp",  # dummy — we’ll fix properly in a sec
+            src_io="unknown",
+            mcast_group=self.module.mcast_group,
+            block_offset=0,
+            block_size=96,
+        )
         self.module.input_connections[self.io_id] = rec
         self.state = InputState.IIdleConnected
         self.module._start_receiver(self.io_id, group, offset, block_size)
@@ -225,25 +283,30 @@ class InputJack:
         self._set_led()
 
     def on_initiate(self, msg: ProtocolMessage):
-        if msg.module_id == self.module.module_id:
+        # Ignore our own INITIATE messages
+        if msg.module_id == self.module.module_id and msg.io_id == self.io_id:
             return
-        payload = msg.payload or {}
-        src_type = payload.get("type", "unknown")
+
+        # Only react when we're waiting for a connection
+        if self.state not in (InputState.ISelfCompatible, InputState.IIdleDisconnected):
+            return
+
+        # Extract offered type from INITIATE payload
+        src_type = msg.payload.get("type", "unknown")
         my_type = self.module.inputs[self.io_id].get("type", "unknown")
 
-        if my_type != src_type:
-            if self.state == InputState.IPending:
-                self.state = InputState.IOtherPending
-            return
+        logger.info(f"INITIATE from {msg.module_id}:{msg.io_id} type='{src_type}' → my type='{my_type}'")
 
-        # compatible
-        if self.state in (InputState.IIdleDisconnected, InputState.IOtherCompatible):
+        if src_type == my_type:
+            # Compatible — go pending
             self.state = InputState.IPending
-            self.pending_initiator = (msg.module_id, msg.io_id, payload)
-        elif self.state == InputState.IPending:
-            if (msg.module_id, msg.io_id) == self.pending_initiator[:2]:
-                self.state = InputState.IPendingSame
-            # else stay IPending
+            self.pending_initiator = (msg.module_id, msg.io_id)
+            logger.debug(f"[{self.module.module_id}] {self.io_id} PENDING ← {msg.module_id}:{msg.io_id}")
+        else:
+            # Not compatible — reject
+            self.state = InputState.IOtherPending
+            logger.debug(f"[{self.module.module_id}] {self.io_id} REJECTED (type mismatch)")
+
         self._set_led()
 
     def on_cancel(self, msg: ProtocolMessage):
@@ -352,65 +415,3 @@ class ConnectionProtocol:
             if msg.io_id in self.output_jacks:
                 self.output_jacks[msg.io_id].on_show_connected(msg)
                 
-    def _refresh_gui_from_controls(self):
-        """
-        Universal restore method — works for every module type.
-        Called on module creation and on patch restore.
-        """
-        # ── 1. Restore control values (sliders/knobs) ───────────────────────
-        # All modules have self.controls and self.control_vars (or similar)
-        control_vars = getattr(self, "control_vars", {})
-        for ctrl_id, var in control_vars.items():
-            if ctrl_id in self.controls:
-                # This triggers Tkinter variable → GUI update
-                var.set(self.controls[ctrl_id])
-
-        # ── 2. Restore connection LEDs (respect pending states) ─────────────
-        # INPUTS
-        for io_id, jack in self.input_jacks.items():
-            rec = self.input_connections.get(io_id)
-            if rec:
-                # Connected → BLINK_RAPID, but don't override active pending modes
-                if jack.state not in (
-                    InputState.IPending,
-                    InputState.IPendingSame,
-                    InputState.ISelfCompatible,
-                    InputState.IOtherCompatible,
-                    InputState.IOtherPending
-                ):
-                    self._queue_led_update(io_id, LedState.BLINK_RAPID)
-            else:
-                # Disconnected → OFF, unless pending/compatible
-                if jack.state not in (
-                    InputState.IPending,
-                    InputState.IPendingSame,
-                    InputState.ISelfCompatible,
-                    InputState.IOtherCompatible
-                ):
-                    self._queue_led_update(io_id, LedState.OFF)
-
-        # OUTPUTS
-        for io_id, jack in self.output_jacks.items():
-            if jack.state in (OutputState.OIdle, OutputState.OCompatible):
-                self._queue_led_update(io_id, LedState.SOLID)
-            # OSelfPending → leave blinking (correct)
-            # OOtherPending / ONotCompatible → leave OFF (correct)
-            
-    def get_state(self) -> Dict:
-            """Return current module state for patch save"""
-            connections = {}
-            for io_id, rec in self.input_connections.items():
-                if rec:
-                    connections[io_id] = {
-                        "src": rec.src,
-                        "group": rec.mcast_group,
-                        "offset": rec.block_offset,
-                        "block_size": rec.block_size,
-                    }
-            return {
-                "controls": self.controls.copy(),
-                "connections": connections
-            }
-            
-    def _stop_receiver(self, io_id: str):
-            pass

@@ -41,11 +41,11 @@ class LfoModule(ConnectionProtocol, PatchProtocol, BaseModule):
         # self._init_connection_states()
         # self._sync_initial_leds()
         self._ensure_io_defs()          # ← NEW
-        self._refresh_gui_from_controls()   # ← now comes from ConnectionProtocol
 
         # 4. Build GUI
         self._setup_gui(parent_root)
         self.set_root(self.root)
+        self._refresh_gui_from_controls()   # ← now comes from PatchProtocol
 
         # 5. Final refresh (protects pending states + restores slider on patch load)
         if hasattr(self, "_refresh_gui_from_controls"):
@@ -83,6 +83,7 @@ class LfoModule(ConnectionProtocol, PatchProtocol, BaseModule):
             f = float(val)
             if abs(f - self.controls["rate"]) >= HYSTERESIS:
                 self.controls["rate"] = f
+                self.rate_var.set(f)   # ← THIS LINE IS REQUIRED
         except ValueError:
             pass
 
