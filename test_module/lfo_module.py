@@ -34,9 +34,11 @@ class LfoModule(ConnectionProtocol, PatchProtocol, BaseModule):
         self._cv_thread = None
         self.rate_var = tk.DoubleVar(value=1.0)
 
-        # 3. Initialise connection state
-        self._init_connection_states()
-        self._sync_initial_leds()
+        # 3. Initialize connection states (must come after inputs/outputs defined)
+        # self._init_connection_states()
+        # self._sync_initial_leds()
+        self._ensure_io_defs()          # ← NEW
+        self._refresh_gui_from_controls()   # ← now comes from ConnectionProtocol
 
         # 4. Build GUI
         self._setup_gui(parent_root)
@@ -81,24 +83,6 @@ class LfoModule(ConnectionProtocol, PatchProtocol, BaseModule):
         except ValueError:
             pass
 
-    def _refresh_gui_from_controls(self):
-        # LFO only has "rate"
-        self.rate_var.set(self.controls.get("rate", 1.0))
-
-        # Protect pending states but still show real connections
-        for io_id, rec in getattr(self, "input_connections", {}).items():
-            if self.input_states.get(io_id) in ("IPending", "ISelfCompatible"):
-                continue
-            led = LedState.BLINK_RAPID if rec else LedState.OFF
-            self.input_states[io_id] = "IIdleConnected" if rec else "IIdleDisconnected"
-            self._queue_led_update(io_id, led)
-
-        for io_id in self.outputs:
-            if self.output_states.get(io_id) not in ("OSelfPending", "OCompatible"):
-                self._queue_led_update(io_id, LedState.SOLID)
-
-        if self.root:
-            self.root.update_idletasks()
 
     def start_sending(self):
         if self._cv_thread is None or not self._cv_thread.is_alive():

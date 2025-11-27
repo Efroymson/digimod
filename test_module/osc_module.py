@@ -48,8 +48,9 @@ class OscModule(ConnectionProtocol, PatchProtocol, BaseModule):
         self.controls_lock = threading.Lock()
 
         # 3. Initialize connection states (must come after inputs/outputs defined)
-        self._init_connection_states()
-        self._sync_initial_leds()
+        # self._init_connection_states()
+        # self._sync_initial_leds()
+        self._ensure_io_defs()          # ← NEW
 
         # 4. Build GUI
         self._setup_gui(parent_root)
@@ -177,25 +178,7 @@ class OscModule(ConnectionProtocol, PatchProtocol, BaseModule):
         self._cv_receiver = threading.Thread(target=receiver, daemon=True)
         self._cv_receiver.start()
 
-    def _refresh_gui_from_controls(self):
-        self.freq_var.set(self.controls.get("freq", 440.0))
-        self.fm_var.set(self.controls.get("fm_depth", 0.5))
-
-        # PROTECT PENDING STATES: Only refresh connected/disconnected, skip IPending/ISelfCompatible
-        for io_id, rec in getattr(self, "input_connections", {}).items():
-            if self.input_states.get(io_id) in (InputState.IPending, InputState.ISelfCompatible):
-                continue  # Don't overwrite pending visuals
-            state_str = "IIdleConnected" if rec else "IIdleDisconnected"
-            led = LedState.BLINK_RAPID if rec else LedState.OFF
-            self.input_states[io_id] = state_str  # Enum string for compatibility
-            self._queue_led_update(io_id, led)
-
-        for io_id in self.outputs:
-            if self.output_states.get(io_id) not in (OutputState.OSelfPending, OutputState.OCompatible):
-                self._queue_led_update(io_id, LedState.SOLID)  # Protect pending outputs too
-
-        if self.root:
-            self.root.update_idletasks()
+    
 
     def on_closing(self):
         super().on_closing()

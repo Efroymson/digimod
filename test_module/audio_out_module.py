@@ -39,10 +39,13 @@ class AudioOutModule(ConnectionProtocol, PatchProtocol, BaseModule):
         self._left_receiver = None
         self._right_receiver = None
 
-        self._init_connection_states()
         self._setup_gui(parent_root)
         self.set_root(self.root)
-        self._sync_initial_leds()
+        # 3. Initialize connection states (must come after inputs/outputs defined)
+        # self._init_connection_states()
+        # self._sync_initial_leds()
+        self._ensure_io_defs()          # ← NEW
+        self._refresh_gui_from_controls()   # ← now comes from ConnectionProtocol
         self._update_display()
         if self.root:
             self.root.update_idletasks()

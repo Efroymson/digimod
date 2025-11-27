@@ -54,7 +54,7 @@ class PatchProtocol:
                 lo, hi = self.control_ranges[k]
                 self.controls[k] = max(lo, min(hi, float(v)))
 
-        # 2. WIPE ALL CONNECTIONS — YOUR GOLDEN RULE
+        # 2. WIPE ALL CONNECTIONS — GOLDEN RULE
         for io in list(self.input_connections.keys()):
             self.input_connections[io] = None
 
@@ -70,32 +70,6 @@ class PatchProtocol:
             )
             self.input_connections[io] = rec
 
-        # 4. Full visual reset
+        # 4. ONE AND ONLY ONE CALL — universal, correct, safe
         if self.root:
-            self.root.after(50, self._full_ui_refresh)
-
-    def _full_ui_refresh(self):
-        # TOTAL RESET
-        self._init_connection_states()
-        self._sync_initial_leds()
-
-        # Restore controls
-        if hasattr(self, "_refresh_gui_from_controls"):
-            self._refresh_gui_from_controls()
-
-        # Re-apply real connections
-        for io_id, rec in self.input_connections.items():
-            if rec:
-                self.input_states[io_id] = InputState.IIdleConnected
-                self._queue_led_update(io_id, LedState.BLINK_RAPID)
-                self._start_receiver(io_id, rec.mcast_group, rec.block_offset, rec.block_size)
-            else:
-                self.input_states[io_id] = InputState.IIdleDisconnected
-                self._queue_led_update(io_id, LedState.OFF)
-
-        # Outputs always SOLID
-        for io_id in self.outputs:
-            self._queue_led_update(io_id, LedState.SOLID)
-
-        if hasattr(self, "_update_display"):
-            self._update_display()
+            self.root.after(50, self._refresh_gui_from_controls)
