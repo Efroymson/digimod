@@ -54,19 +54,18 @@ class OutputJack:
         }
         self.module._queue_led_update(self.io_id, mapping[self.state])
 
-    def short_press(self):
-        if self.state == OutputState.OIdle:
+    def short_press(self, io_id=None):
+        if self.state in (OutputState.OIdle, OutputState.OCompatible):
             self._send_initiate()
             self.state = OutputState.OSelfPending
-        elif self.state == OutputState.OSelfPending:
+            self._set_led()
+
+    def long_press(self, io_id=None):
+        if self.state != OutputState.OIdle:
             self.module._broadcast_cancel()
             self.state = OutputState.OIdle
-        elif self.state in (OutputState.OCompatible,):
-            self._send_initiate()
-            self.state = OutputState.OSelfPending
-        # else: do nothing (OOtherPending, ONotCompatible)
-        self._set_led()
-
+            self._set_led()
+            
     def _send_initiate(self):
         info = self.module.outputs[self.io_id]
         payload = {
@@ -175,7 +174,7 @@ class InputJack:
         }
         self.module._queue_led_update(self.io_id, mapping[self.state])
 
-    def short_press(self):
+    def short_press(self, io_id=None):
             if self.state == InputState.IIdleDisconnected:
                 self._send_compatible()
                 self.state = InputState.ISelfCompatible
@@ -219,7 +218,7 @@ class InputJack:
                 logger.info(f"[{self.module.module_id}] Connected {self.io_id} ← {src_module}:{src_io}")
             self._set_led()
 
-    def long_press(self):
+    def long_press(self, io_id=None):
         if self.state == InputState.IIdleConnected:
             self._disconnect()
         elif self.state == InputState.ISelfCompatible:

@@ -108,19 +108,19 @@ class MainApp:
         n = len([m for m in self.modules.values() if m.type == "osc"])
         mod = OscModule(f"osc_{n}", self.root)
         self.modules[mod.module_id] = mod
-        self._log(f"Added {mod.module_id} @ {mod.ip}")
+        self._log(f"Added {mod.module_id} @ {mod.unicast_ip} → {mod.mcast_group}")
 
     def add_lfo(self):
         n = len([m for m in self.modules.values() if m.type == "lfo"])
         mod = LfoModule(f"lfo_{n}", self.root)
         self.modules[mod.module_id] = mod
-        self._log(f"Added {mod.module_id} @ {mod.ip}")
+        self._log(f"Added {mod.module_id} @ {mod.unicast_ip} → {mod.mcast_group}")
 
     def add_audio_out(self):
         n = len([m for m in self.modules.values() if m.type == "audio_out"])
         mod = AudioOutModule(f"audio_out_{n}", self.root)
         self.modules[mod.module_id] = mod
-        self._log(f"Added {mod.module_id} @ {mod.ip}")
+        self._log(f"Added {mod.module_id} @ {mod.unicast_ip} → {mod.mcast_group}")
 
     def save_to_slot(self):
         self.saved_states.clear()
