@@ -24,7 +24,7 @@ PACKET_SIZE = BLOCK_SIZE * 3
 AUDIO_GROUP_L = '239.100.2.150'
 AUDIO_GROUP_R = '239.100.2.151'
 
-class AudioOutModule(ConnectionProtocol, PatchProtocol, BaseModule):
+class AudioOutModule(Module, ConnectionProtocol, PatchProtocol, BaseModule):
     def __init__(self, mod_id: str, parent_root: tk.Tk = None):
         super().__init__(mod_id, "audio_out")  # FIRST — no mcast_group needed
 

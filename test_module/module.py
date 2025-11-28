@@ -37,11 +37,21 @@ class KnobSlider:
         self.saved_value = clamped
 
 class Module:
-    def __init__(self, mod_id: str, mod_type: str, unicast_ip: str = "192.168.1.100"):
+    _next_instance_id = 100  # starts at 127.0.0.100
+    def __init__(self, mod_id: str, mod_type: str, unicast_ip: str = None):
+        print(f"Module.__init__ called for {mod_id} type={mod_type} ip={unicast_ip}")  # ← ADD THIS
+        if unicast_ip is None:
+             # Auto-assign unique loopback IP
+             self.unicast_ip = f"127.0.0.{Module._next_instance_id}"
+             Module._next_instance_id += 1
+             if Module._next_instance_id > 200:
+                 raise RuntimeError("Too many modules — out of loopback IPs!")
+        else:
+             self.unicast_ip = unicast_ip
         self.module_id = mod_id
         self.type = mod_type
-        self.unicast_ip = unicast_ip
-        self.mcast_group = derive_mcast_group(unicast_ip)
+        
+        self.mcast_group = derive_mcast_group(self.unicast_ip)
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -52,6 +62,17 @@ class Module:
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)  # ← Critical!
         self.sock.settimeout(0.1)
+        
+        # Audio/CV receive socket — bound to this module's simulated IP
+        self.audio_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self.audio_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            self.audio_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        self.audio_socket.bind((self.unicast_ip, 5005))  # ← THIS IS PERFECT
+        self.audio_socket.settimeout(0.01)
+        
+        self._audio_thread = threading.Thread(target=self._audio_receive_loop, daemon=True)
+        self._audio_thread.start()
 
         self.inputs = {}
         self.outputs = {}
@@ -241,12 +262,26 @@ class Module:
                 resp = ProtocolMessage(ProtocolMessageType.STATE_RESPONSE.value, self.module_id, payload=state)
                 self.sock.sendto(resp.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
 
+    def _audio_receive_loop(self):
+        while True:
+            try:
+                data, _ = self.audio_socket.recvfrom(4096)
+                # Demux to correct input based on source multicast group
+                # Subclasses override _handle_audio_packet(data) if needed
+                if hasattr(self, "_handle_audio_packet"):
+                    self._handle_audio_packet(data)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if hasattr(self, "_audio_thread"):  # still alive
+                    logger.debug(f"[{self.module_id}] Audio recv error: {e}")
+
     def _start_receiver(self, io_id: str, group: str, offset: int = 0, block_size: int = 96):
         try:
-            mreq = struct.pack("4sl", socket.inet_aton(group), socket.INADDR_ANY)
-            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            mreq = struct.pack("4sl", socket.inet_aton(group), socket.inet_aton(self.unicast_ip))
+            self.audio_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         except Exception as e:
-            logger.debug(f"[{self.module_id}] Add membership {group}: {e}")
+            logger.warning(f"[{self.module_id}] Join failed {group}: {e}")
 
         self.input_connections[io_id] = ConnectionRecord(
             src="", src_io="", mcast_group=group,
@@ -258,15 +293,16 @@ class Module:
         if rec and rec.mcast_group:
             try:
                 mreq = struct.pack("4sl", socket.inet_aton(rec.mcast_group), socket.INADDR_ANY)
-                self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
+                self.audio_socket.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
+                logger.debug(f"[{self.module_id}] Dropped {rec.mcast_group}")
             except Exception as e:
-                logger.debug(f"[{self.module_id}] Drop membership {rec.mcast_group}: {e}")
-
+                logger.debug(f"[{self.module_id}] Drop failed: {e}")
         self.input_connections[io_id] = None
         
     def on_closing(self):
         try:
-            self.sock.close()
+            self.sock.close()  # perhaps rename this to protocol_sock
+            self.audio_socket.close() # perhaps rename this to audio_cv_sock
         except:
             pass
         if self.root:

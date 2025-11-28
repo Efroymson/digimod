@@ -69,6 +69,11 @@ class PatchProtocol:
                 block_size=info.get("block_size", 96),
             )
             self.input_connections[io] = rec
+            
+        if io in self.input_jacks:
+                    jack = self.input_jacks[io]
+                    jack.state = InputState.IIdleConnected
+                    jack._set_led()  # Force LED to BLINK_RAPID
 
         # 4. ONE AND ONLY ONE CALL — universal, correct, safe
         if self.root:

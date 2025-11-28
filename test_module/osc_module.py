@@ -23,14 +23,7 @@ BLOCK_SIZE = 96
 
 class OscModule(Module):
     def __init__(self, mod_id: str, parent_root: tk.Tk = None):
-        # Loopback IP for simulator
-        try:
-            instance_num = int(mod_id.split('_')[-1])
-        except:
-            instance_num = 0
-        simulated_ip = f"127.0.0.{100 + instance_num}"
-
-        super().__init__(mod_id, "osc", unicast_ip=simulated_ip)
+        super().__init__(mod_id, "osc")  # ← no IP needed!
 
         # I/O — each osc uses its own multicast group
         self.inputs = {"fm": {"type": "cv"}}

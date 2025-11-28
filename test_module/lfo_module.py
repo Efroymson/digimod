@@ -21,10 +21,8 @@ LFO_RATE = 1000
 class LfoModule(Module):
     def __init__(self, mod_id: str, parent_root: tk.Tk = None):
         # Use loopback for simulator
-        instance_num = int(mod_id.split('_')[-1]) if '_' in mod_id else 0
-        simulated_ip = f"127.0.0.{200 + instance_num}"
 
-        super().__init__(mod_id, "lfo", unicast_ip=simulated_ip)
+        super().__init__(mod_id, "lfo")
 
         self.inputs = {}
         self.outputs = {"cv": {"type": "cv", "group": self.mcast_group}}
