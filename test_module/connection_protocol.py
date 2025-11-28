@@ -62,7 +62,7 @@ class OutputJack:
 
     def long_press(self, io_id=None):
         if self.state != OutputState.OIdle:
-            self.module._broadcast_cancel()
+            self.module.send_cancel(self.io_id)   # ← uses public method
             self.state = OutputState.OIdle
             self._set_led()
             
@@ -101,8 +101,9 @@ class OutputJack:
         self._set_led()
 
     def on_cancel(self, msg: ProtocolMessage):
-        if self.state in (OutputState.OSelfPending, OutputState.OOtherPending,
-                          OutputState.OCompatible, OutputState.ONotCompatible):
+        # We don't care whose CANCEL this is — if ANY cancel comes in,
+        # and we're not idle, we go back to OIdle
+        #if self.state != OutputState.OIdle: #no need to test, just change state
             self.state = OutputState.OIdle
             self._set_led()
 
