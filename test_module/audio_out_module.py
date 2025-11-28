@@ -9,6 +9,8 @@ import socket
 import struct
 import logging
 
+from module import Module, KnobSlider
+
 from base_module import BaseModule, LedState, ProtocolMessage, ProtocolMessageType, CONTROL_MULTICAST, UDP_CONTROL_PORT, JackWidget
 from connection_protocol import ConnectionProtocol
 from patch_protocol import PatchProtocol

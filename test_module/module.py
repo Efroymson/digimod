@@ -119,21 +119,19 @@ class Module:
         return {"controls": controls, "connections": connections}
 
     def iterate_for_restore(self, data: Dict):
-        # Restore controls
+        # 1. Restore controls
         for ctrl_id, value in data.get("controls", {}).items():
             if ctrl_id in self.knob_sliders:
                 self.knob_sliders[ctrl_id].restore(value)
 
-        # Wipe all connections
+        # 2. Wipe all connections and receivers
         for io in self.inputs:
             if io in self.input_connections:
                 if hasattr(self, "_stop_receiver"):
                     self._stop_receiver(io)
-                if io in self.input_jacks:
-                    self.input_jacks[io].state = InputState.IIdleDisconnected
-                    self._queue_led_update(io, LedState.OFF)
+                self.input_connections[io] = None
 
-        # Re-apply connections
+        # 3. Re-apply saved connections
         for io, info in data.get("connections", {}).items():
             if io not in self.inputs or not info:
                 continue
@@ -150,15 +148,24 @@ class Module:
             if hasattr(self, "_start_receiver"):
                 self._start_receiver(io, rec.mcast_group, rec.block_offset, rec.block_size)
 
-            if io in self.input_jacks:
+        # CRITICAL: Set visual state AFTER all connections are applied
+        for io, rec in self.input_connections.items():
+            if rec and io in self.input_jacks:
                 self.input_jacks[io].state = InputState.IIdleConnected
                 self._queue_led_update(io, LedState.BLINK_RAPID)
+            elif io in self.input_jacks:
+                self.input_jacks[io].state = InputState.IIdleDisconnected
+                self._queue_led_update(io, LedState.OFF)
 
-        # Final refresh
+        # Force outputs to OIdle
+        for jack in self.output_jacks.values():
+            jack.state = OutputState.OIdle
+            jack._set_led()
+
         self.refresh_all_gui()
         if self.root:
-            self.root.update_idletasks()
-
+            self.root.update_idletasks() 
+            
     def refresh_all_gui(self):
         for jack in self.input_jacks.values():
             jack._set_led()
@@ -214,8 +221,9 @@ class Module:
                 jack.on_initiate(msg)
             elif msg.type == ProtocolMessageType.CANCEL.value:
                 jack.on_cancel(msg)
-            elif msg.type == ProtocolMessageType.COMPATIBLE.value and hasattr(jack, "on_compatible"):
-                jack.on_compatible(msg)
+            elif msg.type == ProtocolMessageType.COMPATIBLE.value:
+                if isinstance(jack, OutputJack):   # ← ONLY output jacks process COMPATIBLE
+                    jack.on_compatible(msg)
             elif msg.type == ProtocolMessageType.SHOW_CONNECTED.value and hasattr(jack, "on_show_connected"):
                 jack.on_show_connected(msg)
 
