@@ -220,13 +220,17 @@ class InputJack:
             self._set_led()
 
     def long_press(self, io_id=None):
-        if self.state == InputState.IIdleConnected:
-            self._disconnect()
-        elif self.state == InputState.ISelfCompatible:
+        if self.state == InputState.ISelfCompatible:
+            self.module.send_cancel(self.io_id)
             self.state = InputState.IIdleDisconnected
-            self.module._broadcast_cancel()  # abort our own compatible mode
-        self._set_led()
+            self.module._queue_led_update(self.io_id, LedState.OFF)
 
+        elif self.state == InputState.IIdleConnected:
+            if hasattr(self.module, "_stop_receiver"):
+                self.module._stop_receiver(self.io_id)
+            self.state = InputState.IIdleDisconnected
+            self.module._queue_led_update(self.io_id, LedState.OFF)
+            
     def _send_compatible(self):
         info = self.module.inputs[self.io_id]
         payload = {"type": info.get("type", "unknown")}

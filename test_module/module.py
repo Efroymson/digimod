@@ -90,6 +90,17 @@ class Module:
         msg = ProtocolMessage(ProtocolMessageType.CANCEL.value, self.module_id, self.type, io_id, {})
         self.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
         logger.info(f"[{self.module_id}] CANCEL → {io_id}")
+        
+    def _notify_self_compatible(self, input_io_id: str):
+        msg = ProtocolMessage(
+            ProtocolMessageType.COMPATIBLE.value,
+            self.module_id,
+            self.type,
+            input_io_id,
+            {"type": self.inputs[input_io_id]["type"]}
+        )
+        self.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+        logger.info(f"[{self.module_id}] COMPATIBLE sent from input {input_io_id}")
 
     # ===================================================================
     # Save / Restore
@@ -108,19 +119,25 @@ class Module:
         return {"controls": controls, "connections": connections}
 
     def iterate_for_restore(self, data: Dict):
+        # Restore controls
         for ctrl_id, value in data.get("controls", {}).items():
             if ctrl_id in self.knob_sliders:
                 self.knob_sliders[ctrl_id].restore(value)
 
+        # Wipe all connections
         for io in self.inputs:
-            self.input_connections[io] = None
-            if io in self.input_jacks:
-                self.input_jacks[io].state = InputState.IIdleDisconnected
-                self._queue_led_update(io, LedState.OFF)
+            if io in self.input_connections:
+                if hasattr(self, "_stop_receiver"):
+                    self._stop_receiver(io)
+                if io in self.input_jacks:
+                    self.input_jacks[io].state = InputState.IIdleDisconnected
+                    self._queue_led_update(io, LedState.OFF)
 
+        # Re-apply connections
         for io, info in data.get("connections", {}).items():
             if io not in self.inputs or not info:
                 continue
+
             rec = ConnectionRecord(
                 src=info["src"],
                 src_io="",
@@ -129,10 +146,15 @@ class Module:
                 block_size=info.get("block_size", 96),
             )
             self.input_connections[io] = rec
+
             if hasattr(self, "_start_receiver"):
                 self._start_receiver(io, rec.mcast_group, rec.block_offset, rec.block_size)
-            self._queue_led_update(io, LedState.BLINK_RAPID)
 
+            if io in self.input_jacks:
+                self.input_jacks[io].state = InputState.IIdleConnected
+                self._queue_led_update(io, LedState.BLINK_RAPID)
+
+        # Final refresh
         self.refresh_all_gui()
         if self.root:
             self.root.update_idletasks()
@@ -211,6 +233,29 @@ class Module:
                 resp = ProtocolMessage(ProtocolMessageType.STATE_RESPONSE.value, self.module_id, payload=state)
                 self.sock.sendto(resp.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
 
+    def _start_receiver(self, io_id: str, group: str, offset: int = 0, block_size: int = 96):
+        try:
+            mreq = struct.pack("4sl", socket.inet_aton(group), socket.INADDR_ANY)
+            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except Exception as e:
+            logger.debug(f"[{self.module_id}] Add membership {group}: {e}")
+
+        self.input_connections[io_id] = ConnectionRecord(
+            src="", src_io="", mcast_group=group,
+            block_offset=offset, block_size=block_size
+        )
+
+    def _stop_receiver(self, io_id: str):
+        rec = self.input_connections.get(io_id)
+        if rec and rec.mcast_group:
+            try:
+                mreq = struct.pack("4sl", socket.inet_aton(rec.mcast_group), socket.INADDR_ANY)
+                self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
+            except Exception as e:
+                logger.debug(f"[{self.module_id}] Drop membership {rec.mcast_group}: {e}")
+
+        self.input_connections[io_id] = None
+        
     def on_closing(self):
         try:
             self.sock.close()
