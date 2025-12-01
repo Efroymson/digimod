@@ -63,14 +63,15 @@ class Module:
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)  # ← Critical!
         self.sock.settimeout(0.1)
         
-        # Audio/CV receive socket — bound to this module's simulated IP
+        # Audio/CV receive socket — FIXED for multicast/loopback
         self.audio_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.audio_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if hasattr(socket, "SO_REUSEPORT"):
             self.audio_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        self.audio_socket.bind((self.unicast_ip, 5005))  # ← THIS IS PERFECT
+        self.audio_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)  # ← ADD: Critical for loopback!
+        self.audio_socket.bind(('', 5005))  # ← FIXED: Bind to all interfaces (was sometimes unicast_ip)
         self.audio_socket.settimeout(0.01)
-        
+           
         self._audio_thread = threading.Thread(target=self._audio_receive_loop, daemon=True)
         self._audio_thread.start()
 
@@ -277,27 +278,28 @@ class Module:
                     logger.debug(f"[{self.module_id}] Audio recv error: {e}")
 
     def _start_receiver(self, io_id: str, group: str, offset: int = 0, block_size: int = 96):
-        try:
-            mreq = struct.pack("4sl", socket.inet_aton(group), socket.inet_aton(self.unicast_ip))
-            self.audio_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-        except Exception as e:
-            logger.warning(f"[{self.module_id}] Join failed {group}: {e}")
+            try:
+                mreq = struct.pack("4sl", socket.inet_aton(group), socket.INADDR_ANY)  # ← VERIFIED FIX
+                self.audio_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                logger.debug(f"[{self.module_id}] Joined {group} for {io_id}")
+            except Exception as e:
+                logger.warning(f"[{self.module_id}] Join failed {group}: {e}")
 
-        self.input_connections[io_id] = ConnectionRecord(
-            src="", src_io="", mcast_group=group,
-            block_offset=offset, block_size=block_size
-        )
+            self.input_connections[io_id] = ConnectionRecord(
+                src="", src_io="", mcast_group=group,
+                block_offset=offset, block_size=block_size
+            )
 
     def _stop_receiver(self, io_id: str):
-        rec = self.input_connections.get(io_id)
-        if rec and rec.mcast_group:
-            try:
-                mreq = struct.pack("4sl", socket.inet_aton(rec.mcast_group), socket.INADDR_ANY)
-                self.audio_socket.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
-                logger.debug(f"[{self.module_id}] Dropped {rec.mcast_group}")
-            except Exception as e:
-                logger.debug(f"[{self.module_id}] Drop failed: {e}")
-        self.input_connections[io_id] = None
+            rec = self.input_connections.get(io_id)
+            if rec and rec.mcast_group:
+                try:
+                    mreq = struct.pack("4sl", socket.inet_aton(rec.mcast_group), socket.INADDR_ANY)  # ← VERIFIED FIX
+                    self.audio_socket.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
+                    logger.debug(f"[{self.module_id}] Dropped {rec.mcast_group}")
+                except Exception as e:
+                    logger.debug(f"[{self.module_id}] Drop failed: {e}")
+            self.input_connections[io_id] = None
         
     def on_closing(self):
         try:

@@ -43,7 +43,7 @@ class OutputJack:
         self.module = module
         self.state = OutputState.OIdle
         self._set_led()
-
+        
     def _set_led(self):
         mapping = {
             OutputState.OIdle: LedState.SOLID,
@@ -160,8 +160,90 @@ class InputJack:
         self.io_id = io_id
         self.module = module
         self.state = InputState.IIdleDisconnected
-        self.pending_initiator = None  # (src_mod, src_io, payload)
+        self.type_ = module.inputs[io_id].get("type", "unknown")
+
+        # <<< THESE ARE THE ONLY NEW FIELDS >>>
+        self.connected_src: Optional[str] = None          # e.g. "lfo_0"
+        self.connected_src_io: Optional[str] = None       # e.g. "cv"
+        self.connected_mcast: Optional[str] = None
+        self.connected_offset: Optional[int] = None
+        self.connected_block_size: Optional[int] = None
+        # <<< END NEW FIELDS >>>
+
         self._set_led()
+
+    # ------------------------------------------------------------------
+    #  ACCEPT A PENDING CONNECTION (called both from live use and restore)
+    # ------------------------------------------------------------------
+    def _accept_connection(self, msg: ProtocolMessage):
+        payload = msg.payload
+        self.connected_src = msg.module_id
+        self.connected_src_io = msg.io_id
+        self.connected_mcast = payload.get("group", self.module.mcast_group)
+        self.connected_offset = payload.get("offset", 0)
+        self.connected_block_size = payload.get("block_size", 96)
+
+        # Keep ConnectionRecord in sync (used by save/restore)
+        rec = ConnectionRecord(
+            src=self.connected_src,
+            src_io=self.connected_src_io,          # <-- important for REVEAL
+            mcast_group=self.connected_mcast,
+            block_offset=self.connected_offset,
+            block_size=self.connected_block_size,
+        )
+        self.module.input_connections[self.io_id] = rec
+
+        # Start receiving the audio/CV stream
+        self.module._start_receiver(
+            self.io_id,
+            self.connected_mcast,
+            self.connected_offset,
+            self.connected_block_size,
+        )
+        logger.info(f"[{self.module.module_id}] INPUT {self.io_id} CONNECTED to {self.connected_src}:{self.connected_src_io}")
+
+    # ------------------------------------------------------------------
+    #  USER PRESS (short press)
+    # ------------------------------------------------------------------
+    def short_press(self, io_id=None):
+        # 1. Start looking for a compatible output
+        if self.state == InputState.IIdleDisconnected:
+            self.module.send_compatible(self.io_id)
+            self.state = InputState.ISelfCompatible
+            self._set_led()
+            return
+
+        # 2. Accept the blinking output
+        if self.state == InputState.IPending:
+            msg = getattr(self.module, "pending_msg", None)
+            if msg:
+                self._accept_connection(msg)
+            self.state = InputState.IIdleConnected
+            self._set_led()
+            return
+
+        # 3. REVEAL – show which output we are connected to
+        if self.state == InputState.IIdleConnected:
+            if self.connected_src and self.connected_src_io:
+                payload = {
+                    "target_mod": self.connected_src,
+                    "target_io":  self.connected_src_io
+                }
+                msg = ProtocolMessage(
+                    ProtocolMessageType.SHOW_CONNECTED.value,
+                    self.module.module_id,
+                    io_id=self.io_id,
+                    payload=payload
+                )
+                self.module.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+                logger.debug(f"[{self.module.module_id}] REVEAL → {self.connected_src}:{self.connected_src_io}")
+            return
+
+        # 4. Cancel a pending “compatible” search
+        if self.state == InputState.ISelfCompatible:
+            self.module.send_cancel(self.io_id)
+            self.state = InputState.IIdleDisconnected
+            self._set_led()
 
     def _set_led(self):
         mapping = {
@@ -175,50 +257,7 @@ class InputJack:
         }
         self.module._queue_led_update(self.io_id, mapping[self.state])
 
-    def short_press(self, io_id=None):
-            if self.state == InputState.IIdleDisconnected:
-                self._send_compatible()
-                self.state = InputState.ISelfCompatible
-                self.module._notify_self_compatible(self.io_id)
-            elif self.state == InputState.IIdleConnected:
-                        rec = self.module.input_connections.get(self.io_id)
-                        if rec:
-                            payload = {
-                                "src": rec.src,
-                                "src_io": rec.src_io
-                            }
-                            msg = ProtocolMessage(
-                                ProtocolMessageType.SHOW_CONNECTED.value,
-                                self.module.module_id,
-                                self.module.type,
-                                self.io_id,
-                                payload
-                            )
-                            self.module.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
-                            logger.info(f"[{self.module.module_id}] Sent SHOW_CONNECTED → {rec.src}:{rec.src_io}")
-                        return
-            elif self.state == InputState.IPending:
-                if not self.pending_initiator:
-                    logger.warning(f"[{self.module.module_id}] No pending initiator for {self.io_id}")
-                    return
-
-                src_module, src_io = self.pending_initiator
-
-                rec = ConnectionRecord(
-                    src=src_module,
-                    src_io=src_io,                                   # This is now correct
-                    mcast_group=self.module.mcast_group,            # safe for LFO/Osc
-                    block_offset=0,
-                    block_size=96,
-                )
-                self.module.input_connections[self.io_id] = rec
-                self.module._start_receiver(self.io_id, rec.mcast_group, rec.block_offset, rec.block_size)
-                self.state = InputState.IIdleConnected
-                self.pending_initiator = None
-                self._set_led()
-                logger.info(f"[{self.module.module_id}] Connected {self.io_id} ← {src_module}:{src_io}")
-            self._set_led()
-
+                
     def long_press(self, io_id=None):
         if self.state == InputState.ISelfCompatible:
             self.module.send_cancel(self.io_id)
@@ -252,31 +291,7 @@ class InputJack:
             self.module.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
             logger.info(f"[{self.module.module_id}] REVEAL sent for {self.io_id} → {rec.src}")
 
-    def _accept_connection(self):
-        if not self.pending_initiator:
-            return
-        src_mod, src_io, payload = self.pending_initiator
-        group = payload.get("group")
-        offset = payload.get("offset", 0)
-        block_size = payload.get("block_size", 96)
-        rec = ConnectionRecord(
-            src="temp",  # dummy — we’ll fix properly in a sec
-            src_io="unknown",
-            mcast_group=self.module.mcast_group,
-            block_offset=0,
-            block_size=96,
-        )
-        self.module.input_connections[self.io_id] = rec
-        self.state = InputState.IIdleConnected
-        self.module._start_receiver(self.io_id, group, offset, block_size)
-
-        connect_msg = ProtocolMessage(ProtocolMessageType.CONNECT.value, src_mod, io_id=src_io)
-        self.module.sock.sendto(connect_msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
-
-        logger.info(f"[{self.module.module_id}] Connected {self.io_id} ← {src_mod}:{src_io}")
-        self.pending_initiator = None
-        self._set_led()
-
+   
     def _disconnect(self):
         rec = self.module.input_connections.get(self.io_id)
         if rec:
