@@ -11,9 +11,8 @@ import socket
 import struct
 import logging
 
-from module import Module, KnobSlider
+from module import Module, KnobSlider, JackWidget
 from connection_protocol import InputJack, OutputJack
-from base_module import JackWidget, LedState
 
 logger = logging.getLogger(__name__)
 
@@ -23,43 +22,39 @@ BLOCK_SIZE = 96
 
 class OscModule(Module):
     def __init__(self, mod_id: str, parent_root: tk.Tk = None):
-        super().__init__(mod_id, "osc")  # ← no IP needed!
+        super().__init__(mod_id, "osc")
 
-        # I/O — each osc uses its own multicast group
+        # Define I/O
         self.inputs = {"fm": {"type": "cv"}}
         self.outputs = {"audio": {"type": "audio", "group": self.mcast_group}}
+
+        # Create jacks from I/O definitions
+        self._init_jacks()
 
         # Runtime state
         self.cv_buffer = np.zeros(1024, dtype=np.float32)
         self.cv_phase = 0
         self.osc_phase = 0.0
         self._cv_receiver = None
-        self._audio_thread = None
         self.controls_lock = threading.Lock()
 
-        # === CRITICAL: Create Tk variables BEFORE GUI ===
+        # Controls
         self.freq_var = tk.DoubleVar(value=440.0)
         self.fm_depth_var = tk.DoubleVar(value=0.5)
-
-        # === State machines ===
-        self.input_jacks["fm"] = InputJack("fm", self)
-        self.output_jacks["audio"] = OutputJack("audio", self)
-        self.input_connections["fm"] = None
-
-        # Force correct initial LED state (OIdle = SOLID green)
-        self.output_jacks["audio"]._set_led()          # ← THIS WAS MISSING
-
-        # === Knobs (saved/restored) ===
         self.knob_sliders["freq"] = KnobSlider("freq", (20.0, 20000.0), self.freq_var)
         self.knob_sliders["fm_depth"] = KnobSlider("fm_depth", (0.0, 1.0), self.fm_depth_var)
 
-        # === GUI ===
+        # GUI
         self._setup_gui(parent_root)
         self.set_root(self.root)
 
-        # Start audio
-        self.start_sending()
+        # Audio receive thread — START HERE, AFTER JACKS EXIST
+        self._audio_thread = threading.Thread(target=self._audio_receive_loop, daemon=True)
+        self._audio_thread.start()
 
+        # Audio send
+        self.start_sending()
+        
     def _setup_gui(self, parent_root):
         self.root = tk.Toplevel(parent_root) if parent_root else tk.Tk()
         self.root.title(f"Osc {self.module_id} → {self.mcast_group}")

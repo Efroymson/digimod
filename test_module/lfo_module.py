@@ -9,10 +9,8 @@ import struct
 import socket
 import logging
 
-from module import Module, KnobSlider
+from module import Module, KnobSlider, JackWidget
 from connection_protocol import InputJack, OutputJack
-from base_module import JackWidget, LedState
-
 logger = logging.getLogger(__name__)
 
 UDP_CV_PORT = 5005
@@ -26,6 +24,7 @@ class LfoModule(Module):
 
         self.inputs = {}
         self.outputs = {"cv": {"type": "cv", "group": self.mcast_group}}
+        self._init_jacks()
 
         self.phase = 0.0
         self.rate_var = tk.DoubleVar(value=1.0)

@@ -6,10 +6,10 @@
 import logging
 from enum import Enum, auto
 from typing import Optional, Dict, Any
-from base_module import (
-    ProtocolMessage, ProtocolMessageType, CONTROL_MULTICAST, UDP_CONTROL_PORT,
-    LedState, ConnectionRecord
-)
+
+CONTROL_MULTICAST = "239.255.0.1"
+UDP_CONTROL_PORT = 5000
+UDP_AUDIO_PORT = 5005
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,75 @@ class InputState(Enum):
     IOtherPending = auto()
     IPendingSame = auto()
     IOtherCompatible = auto()
+
+
+class ProtocolMessage:
+    """Simple message container with pack/unpack"""
+    def __init__(self, type_val: int, module_id: str, mod_type: str = "", io_id: str = "", payload: Optional[Dict] = None):
+        self.type = type_val
+        self.module_id = module_id
+        self.mod_type = mod_type
+        self.io_id = io_id
+        self.payload = payload or {}
+
+    def pack(self) -> bytes:
+        payload_json = json.dumps(self.payload).encode('utf-8')
+        payload_len = len(payload_json)
+        header = struct.pack("!BBHH", 
+                           self.type, 
+                           len(self.module_id), 
+                           len(self.mod_type), 
+                           len(self.io_id))
+        body = self.module_id.encode('utf-8') + \
+               self.mod_type.encode('utf-8') + \
+               self.io_id.encode('utf-8') + \
+               payload_json
+        return header + struct.pack("!H", payload_len) + body
+
+    @staticmethod
+    def unpack(data: bytes) -> 'ProtocolMessage':
+        if len(data) < 8:
+            raise ValueError("Too short")
+        type_val, mod_len, type_len, io_len = struct.unpack("!BBHH", data[:6])
+        offset = 6
+        module_id = data[offset:offset+mod_len].decode('utf-8')
+        offset += mod_len
+        mod_type = data[offset:offset+type_len].decode('utf-8')
+        offset += type_len
+        io_id = data[offset:offset+io_len].decode('utf-8')
+        offset += io_len
+        payload_len = struct.unpack("!H", data[offset:offset+2])[0]
+        offset += 2
+        payload = {}
+        if payload_len > 0:
+            payload = json.loads(data[offset:offset+payload_len].decode('utf-8'))
+        return ProtocolMessage(type_val, module_id, mod_type, io_id, payload)
+        
+class ProtocolMessageType(Enum):
+    INITIATE = auto()
+    CANCEL = auto()
+    COMPATIBLE = auto()
+    SHOW_CONNECTED = auto()
+    CONNECTED = auto()           # optional, if you ever use it
+    PATCH_RESTORE = auto()
+    STATE_INQUIRY = auto()
+    STATE_RESPONSE = auto()
+
+class LedState(Enum):
+    OFF = 0
+    SOLID = 1
+    BLINK_SLOW = 2
+    BLINK_RAPID = 3
+
+class ConnectionRecord:
+    __slots__ = ("src", "src_io", "mcast_group", "block_offset", "block_size")
+    def __init__(self, src="", src_io="", mcast_group="", block_offset=0, block_size=96):
+        self.src = src
+        self.src_io = src_io
+        self.mcast_group = mcast_group
+        self.block_offset = block_offset
+        self.block_size = block_size
+        
 
 # ===================================================================
 # OUTPUT JACK STATE MACHINE

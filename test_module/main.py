@@ -10,7 +10,7 @@ import logging
 from osc_module import OscModule
 from lfo_module import LfoModule
 from audio_out_module import AudioOutModule
-from base_module import ProtocolMessage, ProtocolMessageType, CONTROL_MULTICAST, UDP_CONTROL_PORT
+from module import ProtocolMessage, ProtocolMessageType, CONTROL_MULTICAST, UDP_CONTROL_PORT
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

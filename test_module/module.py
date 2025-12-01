@@ -1,19 +1,73 @@
-# module.py — FINAL, CORRECT, TESTED VERSION
-# This is the one that works 100%
-
+# module.py — top of file
 import socket
 import struct
 import threading
 import queue
 import time
 import logging
+import tkinter as tk
+from tkinter import ttk
 from typing import Dict, Any, Optional
-from base_module import (
-    ProtocolMessage, ProtocolMessageType, CONTROL_MULTICAST, UDP_CONTROL_PORT,
-    LedState, ConnectionRecord, JackWidget
-)
-from connection_protocol import InputJack, OutputJack, InputState, OutputState
+from enum import Enum, auto
 
+# ←←← Import the pure logic (safe — no circular import at runtime)
+from connection_protocol import (
+    InputJack, OutputJack, InputState, OutputState,
+    ProtocolMessage, ProtocolMessageType,
+    LedState, ConnectionRecord,
+    CONTROL_MULTICAST, UDP_CONTROL_PORT, UDP_AUDIO_PORT
+)
+# ------------------------------------------------------------------
+# Constants & ProtocolMessage — MOVED HERE from base_module.py
+# ------------------------------------------------------------------
+
+
+
+
+# ------------------------------------------------------------------
+# JackWidget — also moved here (tiny Tkinter widget)
+# ------------------------------------------------------------------
+class JackWidget(tk.Frame):
+    def __init__(self, parent, io_id, label,
+                 short_press_callback=None,
+                 long_press_callback=None,
+                 verbose_text=True):
+        super().__init__(parent, width=80, height=80, bg="gray20", relief="raised", bd=2)
+        self.io_id = io_id
+        self.short_press_callback = short_press_callback
+        self.long_press_callback = long_press_callback
+
+        self.canvas = tk.Canvas(self, width=60, height=60, bg="gray20", highlightthickness=0)
+        self.canvas.pack(pady=5)
+        self.circle = self.canvas.create_oval(10, 10, 50, 50, fill="gray50", outline="white")
+        if verbose_text:
+            tk.Label(self, text=label, fg="white", bg="gray20").pack()
+
+        self.press_time = 0
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+
+    def _on_press(self, event):
+        self.press_time = time.time()
+
+    def _on_release(self, event):
+        duration = time.time() - self.press_time
+        if duration > 0.5 and self.long_press_callback:
+            self.long_press_callback()
+        elif self.short_press_callback:
+            self.short_press_callback()
+
+    def set_state(self, state: LedState):
+        colors = {
+            LedState.OFF: "gray30",
+            LedState.SOLID: "#00ff00",
+            LedState.BLINK_SLOW: "#ffff00",
+            LedState.BLINK_RAPID: "#ff0000",
+        }
+        self.canvas.itemconfig(self.circle, fill=colors.get(state, "gray50"))
+        
 logger = logging.getLogger(__name__)
 
 def derive_mcast_group(unicast_ip: str) -> str:
@@ -72,10 +126,7 @@ class Module:
         self.audio_socket.bind(('', 5005))  # ← FIXED: Bind to all interfaces (was sometimes unicast_ip)
         self.audio_socket.settimeout(0.01)
            
-        self._audio_thread = threading.Thread(target=self._audio_receive_loop, daemon=True)
-        self._audio_thread.start()
-
-        self.inputs = {}
+       
         self.outputs = {}
         self.input_jacks = {}
         self.output_jacks = {}
@@ -90,6 +141,28 @@ class Module:
 
         self._listener_thread = threading.Thread(target=self._listen, daemon=True)
         self._listener_thread.start()
+    
+    # new init helpers
+    def add_input(self, io_id: str, type_: str, group: str = None):
+        self.inputs[io_id] = {"type": type_, "group": group or self.mcast_group}
+
+    def add_output(self, io_id: str, type_: str, group: str = None):
+        self.outputs[io_id] = {"type": type_, "group": group or self.mcast_group}
+        
+    def _init_jacks(self):
+        """Create InputJack/OutputJack instances from self.inputs/self.outputs"""
+        if hasattr(self, "_jacks_initialized"):
+            return
+        self._jacks_initialized = True
+
+        for io_id, info in self.inputs.items():
+            self.input_jacks[io_id] = InputJack(io_id, self)
+
+        for io_id, info in self.outputs.items():
+            self.output_jacks[io_id] = OutputJack(io_id, self)
+            # OutputJack.__init__ already calls _set_led()
+
+        logger.debug(f"[{self.module_id}] Jacks initialized: {list(self.input_jacks)} in, {list(self.output_jacks)} out")
 
     # ===================================================================
     # Public send methods — ONLY these touch the socket
@@ -265,7 +338,7 @@ class Module:
             while True:
                 io, state = self.gui_queue.get_nowait()
                 if io in self.gui_leds:
-                    self.gui_leds[io].update_led(LedState[state])
+                    self.gui_leds[io].set_state(LedState[state])
         except queue.Empty:
             pass
 

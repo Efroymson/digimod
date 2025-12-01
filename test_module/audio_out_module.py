@@ -9,11 +9,8 @@ import socket
 import struct
 import logging
 
-from module import Module, KnobSlider
-
-from base_module import BaseModule, LedState, ProtocolMessage, ProtocolMessageType, CONTROL_MULTICAST, UDP_CONTROL_PORT, JackWidget
-from connection_protocol import ConnectionProtocol
-from patch_protocol import PatchProtocol
+from module import Module, KnobSlider, JackWidget, ProtocolMessage
+from connection_protocol import InputJack, OutputJack
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +21,7 @@ PACKET_SIZE = BLOCK_SIZE * 3
 AUDIO_GROUP_L = '239.100.2.150'
 AUDIO_GROUP_R = '239.100.2.151'
 
-class AudioOutModule(Module, ConnectionProtocol, PatchProtocol, BaseModule):
+class AudioOutModule(Module):
     def __init__(self, mod_id: str, parent_root: tk.Tk = None):
         super().__init__(mod_id, "audio_out")  # FIRST — no mcast_group needed
 
@@ -33,6 +30,7 @@ class AudioOutModule(Module, ConnectionProtocol, PatchProtocol, BaseModule):
             "right": {"type": "audio", "group": AUDIO_GROUP_R}
         }
         self.outputs = {}
+        self._init_jacks()
 
         self.control_ranges = {}
         self.controls = {}
