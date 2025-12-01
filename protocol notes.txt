@@ -1,0 +1,271 @@
+state machine
+
+initial:
+	outputs all on solid -- if pressed, send INITIATE, go to connection_pending
+	inputs all off --  on press send COMPATIBLE  goto initiate_compatible  
+	flashing for connected ones -- press flashes connected output (new message)
+	
+connection_pending: (after INITIATE sent)
+	selected ouput slow blinking -- if pressed cancel connection_pending, return to initial
+	all other outputs off -- if pressed blink three times rapidly, ignore press
+	unconnected inputs solid on -- if pressed make connection
+	connected inputs fast blinking -- if pressed short show connected output (as above)
+										if long press cancel connection go solid
+										
+initiate_compatible:
+	this state is just like initial, except:
+	the input that was pressed to go to this state is slow blinking
+	only outputs that are compatible with this input remain lit, others are off
+	any input key press returns state to initial
+	any output that is solid if pressed sends INITIATE (just like initial)
+	any output that is off if pressed blink three times rapidly, ignore press (like in 		connection_pending state)
+	
+	
+Note on COMPATIBLE message:
+This message is intended to allow the user to understand which OUTPUTS can send to the selected INPUT. In the simple example we have, if I press the LEFT or RIGHT input on an audio output module, that would cause all the LFO outputs to go grey (since they are not compatible with an audio only input).  Oscillator outputs would remain GREEN (on) because they are compatible.
+
+However pressing the FM Input button on an Osc would leave all outputs on, since both LFO and Audio are compatible with an FM input on an oscillator (we perhaps have not discussed this)
+	
+Notes on hardware LEDs vs TCL/TK:
+I was unable to get a flashing behavior reliably on TCL TK, so we went to the following
+GREY = LED OFF
+GREEN = LED ON
+YELLOw = BLINK SLOW
+RED = BLINK FAST
+
+In the real hardware, I only intend to use single color LEDs, so they can only be in one of those four states, coded in TCL/TK by the indicated color.  ORANGE is unused now.
+
+
+To repeat, and hopefully not to contradict, here is my edit of your version of the spec:
+To ensure alignment, here's my read on the spec (terse but complete, with examples from your logs and prior edges):
+
+Global: All modules start in initial. LEDs: Outputs SOLID (green is used for LED ON in TCL/TK) always (connected or not? Assume yes, as "all on solid"
+RE: yes this is correct.  Indeed in the current spec, output modules don't even track whether or not they are connected.
+). Inputs OFF gray unless connected (fast BLINK_RAPID red) or pending (solid on? Or rapid red? Spec says "unconnected inputs solid on" in connection_pending—clarify if solid green or white=available? I'll assume solid white for unconnected in pending, to distinguish from connected red).
+
+In Initial State, only outputs are ON.  All other LEDs are OFF.  This is to signal to the user which are Outputs, and thus can be pressed to initiate a connection.  It also should (I think) make for a nice transition when you press an output button, and suddenly almost all the LEDs in the system flip state, which could be eye catching.  This currently is NOT HAPPENING
+initial:
+
+Outputs: All SOLID green. Press any: Send INITIATE (group, ip), go to connection_pending, yellow BLINK_SLOW on selected.
+Inputs: OFF gray. Press unconnected: Send COMPATIBLE (group), go to initiate_compatible (pressed input yellow BLINK_SLOW).
+Connected inputs: Fast BLINK_RAPID red. Press short: Send SHOW_CONNECTED (io_id), flash connected output 3x orange (revert after). Long press: Send CANCEL, connected input to SOLID green (stay connected? Or disconnect? Assume stay, just stop blink).
+
+
+connection_pending:
+
+Selected output: Yellow BLINK_SLOW. Press: Send CANCEL, gray OFF, back to initial.-- except as an output, it will be ON in initial-state
+Other outputs: OFF gray. Press: 3x orange flash (revert to gray), ignore (no INITIATE).
+Unconnected inputs: Solid white (available). Press: Send CONNECT (group), green SOLID on pressed, gray OFF other inputs, start receiver, back to initial.
+Connected inputs: Fast BLINK_RAPID red. Press short: SHOW_CONNECTED flash. Long: Send CANCEL (own? Or to connected output?), green SOLID (stop blink).
+
+
+initiate_compatible:
+
+Like initial, but pressed input: Yellow BLINK_SLOW.
+Compatible outputs: SOLID green (match input group from COMPATIBLE). Press: Send INITIATE, go to connection_pending (selected yellow, others gray).
+Incompatible outputs: OFF gray. Press: 3x orange flash (revert gray), ignore.
+Any input press (including the yellow one): Back to initial (gray OFF).
+Connected inputs: Fast BLINK_RAPID red (as initial).
+
+
+New Messages:
+
+COMPATIBLE (9): Input → Broadcast {group: input_group}. Response: None (outputs match internally, light solid).
+SHOW_CONNECTED (10): Input → Connected Output {io_id: pressed_input}. Response: None (output flashes 3x orange, revert).
+
+
+Edge Cases (From Logs/Prior):
+
+Self-INITIATE: Ignore (module_id == self).
+Race (Simultaneous INITIATEs): Packet order + IP cmp only if own output pending + initiated_sent. Lower IP wins (process inputs blink), higher: 3x orange on output + CANCEL, gray all.
+Foreign CANCEL: Clear all pending inputs to gray (group match? Spec: Any CANCEL clears? Assume global for simplicity; refine to group if needed).
+Multi-Input: All blink rapid red on match; connect one: Green one, gray others.
+Cancel During Pending: Gray all inputs/selected output.
+No Match: Ignore, no blink/log.
+Protocol-Only: No audio/CV (comment loops); loopback IPs for race test.
+Scale: 10+ modules: Debounce pushes (100ms), queue drop (no beach).
+
+
+
+Unclear? "Flashing for connected ones" in initial (connected inputs red?); "unconnected inputs solid on" in connection_pending (white=available?); Long press on connected input (cancel connection or just stop blink?); COMPATIBLE response (outputs light solid, but if multiple, how distinguish compatible from incompatible in initial?-- answer to this is that in initial state all outputs are on, in initiate_compatible only compatible outputs are on.). Assuming: Connected inputs always red BLINK_RAPID (fast feedback); unconnected solid white in pending; Long press cancels connection (send CANCEL, gray input); COMPATIBLE: Outputs light solid if group match (compatible=group).
+
+Further notes:
+ if an output is selected, only COMPATIBLE inputs are lit up, and so what if you press an incompatible input button? Do not go into initiate_compatible state, rather if an we are in connection_pending state, an incompatible (off) input should do the same fast blink as another output being pressed, and the press is otherwise ignored.
+ 
+ There was a bit of confusion  about what to do if the user happens to press a new output button when one is pending. This is NOT the race condition, and we don't check iPs to see who wins. If your button is off, you refuse to start an output, end of story. The theoretical race condition (we will never see it in the python version because of the mouse interface) is when two buttons that are both ON (i.e. both are in initial state) are pressed at the same time, so both send an INITIATE message. In that case they each will send, and each receive, an INITIATE, and the one with the lower IP address will win the race, and get to stay on. Perhaps to ensure sanity the winner should send out a cancel, and then an immediate second initiate, but lets not do that for now
+ 
+ 
+ PATCH PROTOCOL
+ 
+ If we use the IP address of a module to identify it, we should be sure they stay the same across boots.  I think using DHCP reservations could do this? We would assign a permanent IP address to a new MAC address each time we see it.  Eventually we could run out, but 65,536 is a largish number
+ 
+ 
+ Further documentation:
+ 
+ This document serves **both** as:
+ - Human-readable documentation
+ - A perfect prompt you can paste into any AI to regenerate all files correctly
+
+ ---
+
+ # DMS Connection Protocol & UI Specification  
+ **Version 1.0 — November 23, 2025**  
+ **Status: Final — Ready for Hardware**
+
+ ## Core Principles
+ - **Per-jack state machines** (one for each input, one for each output)
+ - **No global state** — every module acts independently
+ - **INITIATE message contains ALL routing information**
+ - **One multicast group per output module** (derived from IP)
+ - **Visual feedback matches real hardware** — outputs go dark when someone else is patching
+ - **Long press = disconnect**, short press = connect/initiate
+ - **No L/R assumptions** — fully generic, supports mono/stereo/quad/8ch
+
+ ---
+
+ ## State Transition Tables (CSV Source of Truth)
+
+ ### Output States
+ | State             | Short Press                   | Long Press | Receive INITIATE                     | Receive CANCEL       | Receive COMPATIBLE (group=X)        | Receive COMPATIBLE (group="") | LED         |
+ |-------------------|-------------------------------|------------|--------------------------------------|-----------------------|-------------------------------------|-------------------------------|-------------|
+ | OIdle             | → OSelfPending + send INITIATE| —          | → OOtherPending                      | → OIdle               | if group matches → OCompatible else ONotCompatible | → OIdle                       | SOLID (green) |
+ | OSelfPending      | Cancel → OIdle                | —          | Race: lower IP wins → cancel         | → OIdle               | ignored                             | ignored                       | BLINK_SLOW |
+ | OOtherPending     | ignored (flash error)         | —          | ignored                              | → OIdle               | ignored                             | → OIdle                       | OFF         |
+ | OCompatible       | → OSelfPending + send INITIATE| —          | → OOtherPending                      | → OIdle               | ignored                             | → OIdle                       | SOLID       |
+ | ONotCompatible    | ignored (flash error)         | —          | → OOtherPending                      | → OIdle               | ignored                             | → OIdle                       | OFF         |
+
+
+### Output Jack (OutputJack) User Actions — FINAL & AUTHORITATIVE
+
+| Current State         | Short Press Action                                   | Long Press Action                                   | LED State after Action         |
+|-----------------------|------------------------------------------------------|-----------------------------------------------------|--------------------------------|
+| OIdle                 | Send INITIATE → go to OSelfPending                   | (no action)                                         | SOLID (green) → BLINK_SLOW     |
+| OSelfPending          | (no action – user must long-press to cancel)         | Send CANCEL → go to OIdle                           | BLINK_SLOW → SOLID             |
+| OOtherPending         | (no action)                                          | Send CANCEL → go to OIdle                           | OFF → SOLID                    |
+| OCompatible           | Send INITIATE → go to OSelfPending                   | Send CANCEL → go to OIdle                           | SOLID → BLINK_SLOW             |
+| ONotCompatible        | (no action)                                          | Send CANCEL → go to OIdle                           | OFF → SOLID                    |
+
+**Key Rules (per CSV):**
+- **Short press** = attempt to initiate a connection (only allowed in OIdle and OCompatible)
+- **Long press** = universal cancel / reset (allowed in any non-idle state)
+- Long press always broadcasts CANCEL and forces local state back to OIdle (green SOLID)
+- This behavior is identical for all output jacks (audio, CV, etc.)
+
+This table supersedes any earlier conflicting description in the document.
+
+ ### Input States
+ | State                 | Short Press                            | Long Press         | Receive INITIATE (type match) | Receive CANCEL | Receive COMPATIBLE | LED            |
+ |-----------------------|----------------------------------------|--------------------|--------------------------------|----------------|---------------------|----------------|
+ | IIdleDisconnected     | → ISelfCompatible + send COMPATIBLE    | —                  | → IPending                     | —              | —                   | OFF            |
+ | ISelfCompatible       | Cancel → IIdleDisconnected            | —                  | ignored                        | —              | —                   | BLINK_SLOW     |
+ | IPending              | → IIdleConnected + send CONNECT + start receiver | —           | stay IPending                  | → IIdleDisconnected | —             | SOLID          |
+ | IIdleConnected        | —                                      | Disconnect → IIdleDisconnected | ignored                   | —              | —                   | BLINK_RAPID    |
+ | IOtherPending         | ignored                                | —                  | ignored                        | → IIdleDisconnected | —             | OFF            |
+
+ ---
+
+ ## Protocol Messages
+
+ | Type           | Payload Contains                                  | Purpose |
+ |----------------|---------------------------------------------------|---------|
+ | INITIATE       | `group`, `ip`, `type`, `offset`, `block_size`     | Output announces: "I want to connect" |
+ | COMPATIBLE     | `group` (or `""` to cancel)                       | Input says: "Show me compatible outputs" |
+ | CONNECT        | `group`                                           | Input accepts connection |
+ | CANCEL         | `{}` (global) or specific disconnect payload     | Cancel pending or break connection |
+ | SHOW_CONNECTED | `{}`                                              | Flash connected output (future) |
+
+ ---
+
+ ## INITIATE Payload (MUST contain all routing info)
+
+ ```json
+ {
+   "group": "239.100.2.150",
+   "ip": "127.0.1.42",
+   "type": "audio",
+   "offset": 96,
+   "block_size": 96
+ }
+ ```
+
+ This allows any input to know exactly where and how to listen — **no follow-up messages**.
+
+ ---
+
+ ## Per-Jack Connection Record (on input)
+
+ ```python
+ self.inputs["ch2"] = {
+     "type": "audio",
+     "src": "osc_0:audio",           # human readable
+     "mcast_group": "239.100.2.150",
+     "block_offset": 96,             # samples into packet
+     "block_size": 96
+ }
+ ```
+
+ ---
+
+ ## UI: JackWidget (Hardware-Accurate)
+
+ ```python
+ class JackWidget(ttk.Frame):
+     - LED (canvas circle)
+     - Label
+     - Full-frame clickable
+     - Short press (<300ms) → callback
+     - Long press (≥300ms) → long_press_callback
+     - update_led(state: LedState)
+ ```
+
+ LED Colors:
+ - OFF → gray
+ - SOLID → green
+ - BLINK_SLOW → yellow
+ - BLINK_RAPID → red
+ - ERROR flash → orange
+
+ ---
+
+ ## Required Files (Generate with this Prompt)
+
+ **Prompt to AI:**
+
+ > Generate the complete, correct, production-ready Python files for the Digital Modular Synthesizer (DMS) using the exact specification above. Include:
+ >
+ > 1. `connection_protocol.py` — per-IO state machines, INITIATE contains all info, OOtherPending = OFF, IOtherPending state
+ > 2. `base_module.py` — with `JackWidget` compound widget (short/long press)
+ > 3. Example `lfo_module.py`, `osc_module.py`, `audio_out_module.py` using JackWidget and correct connection logic
+ > 4. All LED states and celebrations correct
+ > 5. No global state, thread-safe, queue-only LED updates
+ >
+ > Use the state tables and protocol exactly as defined. This is for real hardware.
+ 
+ Remember that the input is supposed to be empty initially, and will accept whatever group is sent by the output, if a connection is made.  That indeed is the very definition of a connection in this distributed modular synthesizer heavily utilizing multicast IP for data transmission.  A "connection" is just an input agreeing to use data from an output, it needs to know:
+
+ the multicast address it is receiving from
+
+ the offset
+
+ the size of the data (block size)
+
+ It 100% should not be rejecting an offer to INITIATE a connection because the group doesn't match something! The only thing that makes an output compatible with an input (or not) is the type of data (we will later perhaps have a list of types, so an envelope could accept a trigger or a gate)
+ 
+ additional note, this is the latest updated version of the state table in CSV format, just a few changes from what is described above.  Note new REVEAL message from previous version, and now a new state, IOtherCompatible, the purpose of which is to prevent a confusing situation in which multiple inputs are in ISelfCompatible.  Another change: note the CONNECTED message is removed, as not helpful, and the transition from IIdleConnected on an INITIATE is now more complicated, and depends not just on the TYPE field of the INITIATE but also the GROUP and OFFSET (so we know if the INITIATE came from the exact output to which we are connected)
+ 
+ ,,,,,,,
+ ,Short press,Long Press,Initiate,Cancel,Compatible,Reveal,LED Status
+ OIdle,Send Initiate goto OSelfPending,nothing,Go to OOtherPending,Nothing,"Check value, if am compatible go to OCompatible if not go to OnotCompatible ","Check if I am the output connected to the message sender, if so blink fast for three seconds",On
+ OSelfPending,Nothing,Send CANCEL goto OIdle,"Race condition: test IP, if mine is less, nothing, otherwise goto OOtherPending",Goto OIdle,Nothing,"Check if I am the output connected to the message sender, if so blink fast for three seconds",SlowBlinking
+ OOtherPending,Nothing,Send CANCEL goto OIdle,Nothing,Goto OIdle,Nothing,"Check if I am the output connected to the message sender, if so blink fast for three seconds",Off
+ OCompatible,Send Initiate goto OSelfPending,Send CANCEL goto OIdle,Go to OOtherPending,Goto OIdle,Nothing,"Check if I am the output connected to the message sender, if so blink fast for three seconds",On
+ ONotCompatible,Nothing,Send CANCEL goto OIdle,Go to OOtherPending,Goto OIdle,Nothing,"Check if I am the output connected to the message sender, if so blink fast for three seconds",Off
+ ,,,,,,,
+ IIdleDisconnected,Send Compatible goto ISelfCompatible,Nothing,"Check. If compatible, go to IPending, if not go to IOtherPending",Nothing,Go to IOtherCompatible,Nothing (leds already off),Off
+ ISelfCompatible,Nothing,Send CANCEL goto IIdleDisconnected,"Check. If compatible, go to IPending, if not go to IOtherPending",Goto IIdle,Nothing,Turn LED off for three seconds to make flashing more visible,On
+ IPending,"Send Connected, Celebrate connection, Connect*, then goto IPendingSame",Nothing,"Check. If compatible, stay in IPending, if not go to IOtherPending (should not happen)",Goto IIdleDisconnected,Nothing,Turn LED off for three seconds to make flashing more visible,On
+ IIdleConnected,"Reveal Connection: send REVEAL message with IP ADDRESS of connected output , all others go dark, connection blinks fast in sync with this","Remove Connection**, goto IIdleDisconnected","If INITIATE matches our connection exactly, TYPE and GROUP and OFFSET then transition to IPendingSame If INITIATE matches only on TYPE do nothing.  If INITIATE does not match on TYPE go to IOtherPending",Nothing,Nothing,Turn LED off for three seconds to make flashing more visible — BUT NOT IF I SENT THE MESSAGE,Fast blinking
+ IOtherPending,Nothing,nothing,Nothing,Go to IIdleDisconnected,Nothing,Nothing (leds already off),Off
+ IPendingSame,Nothing,"Remove Connection**, goto IIdleDisconnected","This should not happen, but: Nothing if INITIATE matches match, if it does, transition to IIdleConnected",Go to IIdleConnected,Nothing,Turn LED off for three seconds to make flashing more visible,Slow blinking
+ IOtherCompatible,Nothing (no second compatible),Send CANCEL goto IIdleDisconnected,"Check. If compatible, go to IPending, if not go to IOtherPending",Goto IIdleDisconnected,Nothing,Nothing (leds already off),Off
+ 
