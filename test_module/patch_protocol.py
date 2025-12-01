@@ -31,16 +31,17 @@ class PatchProtocol:
 
     
     def get_state(self) -> Dict:
-        connections = {}
-        for io, rec in self.input_connections.items():
-            if rec:
-                connections[io] = {
-                    "src": rec.src,
-                    "group": rec.mcast_group,
-                    "offset": rec.block_offset,
-                    "block_size": rec.block_size,
-                }
-        return {"controls": self.controls.copy(), "connections": connections}
+            connections = {}
+            for io_id, rec in self.input_connections.items():
+                if rec:
+                    connections[io_id] = {
+                        "src": rec.src,
+                        "src_io": rec.src_io,               # <-- add this line
+                        "group": rec.mcast_group,
+                        "offset": rec.block_offset,
+                        "block_size": rec.block_size,
+                    }
+            return {"controls": self.controls.copy(), "connections": connections}
 
     def restore_patch(self, data: Dict):
         if not isinstance(data, dict):
@@ -48,36 +49,55 @@ class PatchProtocol:
         if data.get("target_mod") and data["target_mod"] != self.module_id:
             return
 
-        # 1. Restore controls
+        # ---- 1. Controls ------------------------------------------------
         for k, v in data.get("controls", {}).items():
             if k in self.control_ranges:
                 lo, hi = self.control_ranges[k]
                 self.controls[k] = max(lo, min(hi, float(v)))
 
-        # 2. WIPE ALL CONNECTIONS — GOLDEN RULE
+        # ---- 2. Wipe old connections ------------------------------------
         for io in list(self.input_connections.keys()):
+            if io in self.input_jacks:
+                jack = self.input_jacks[io]
+                jack.state = InputState.IIdleDisconnected
+                jack._set_led()
+            self._stop_receiver(io) if hasattr(self, "_stop_receiver") else None
             self.input_connections[io] = None
 
-        # 3. Re-apply saved connections
+        # ---- 3. Restore saved connections -------------------------------
         for io, info in data.get("connections", {}).items():
             if io not in self.inputs or not info:
                 continue
+
+            # Re-create the ConnectionRecord exactly as during live connect
             rec = ConnectionRecord(
                 src=info["src"],
+                src_io=info.get("src_io", ""),          # <-- needed for REVEAL
                 mcast_group=info["group"],
                 block_offset=info.get("offset", 0),
                 block_size=info.get("block_size", 96),
             )
             self.input_connections[io] = rec
-            
-        if io in self.input_jacks:
-                    jack = self.input_jacks[io]
-                    jack.state = InputState.IIdleConnected
-                    jack._set_led()  # Force LED to BLINK_RAPID
 
-        # 4. ONE AND ONLY ONE CALL — universal, correct, safe
+            # Start receiving again
+            self._start_receiver(io, rec.mcast_group, rec.block_offset, rec.block_size)
+
+            # <<< THIS IS THE CRUCIAL PART THAT WAS MISSING >>>
+            if io in self.input_jacks:
+                jack = self.input_jacks[io]
+                jack.connected_src       = info["src"]
+                jack.connected_src_io     = info.get("src_io", "")
+                jack.connected_mcast      = info["group"]
+                jack.connected_offset     = info.get("offset", 0)
+                jack.connected_block_size = info.get("block_size", 96)
+                jack.state = InputState.IIdleConnected
+                jack._set_led()                     # ← now BLINK_RAPID immediately
+            # <<< END CRUCIAL PART >>>
+
+        # ---- 4. Final GUI refresh ---------------------------------------
         if self.root:
-            self._refresh_gui_from_controls()   # ← call directly, not after()            
+            self.root.after(100, self._refresh_gui_from_controls)
+            
     def _refresh_gui_from_controls(self):
         """
         Universal restore method — works for every module type.
