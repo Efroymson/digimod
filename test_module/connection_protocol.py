@@ -6,7 +6,7 @@
 import logging
 import json
 import struct
-from enum import Enum, auto
+from enum import Enum, auto, IntEnum
 from typing import Optional, Dict, Any
 
 CONTROL_MULTICAST = "239.255.0.1"
@@ -35,91 +35,171 @@ class InputState(Enum):
     IPendingSame = auto()
     IOtherCompatible = auto()
 
+# ===================================================================
+# MESSAGE TYPE ENUM — single byte on the wire
+# ===================================================================
 
-class ProtocolMessage:
-    """Simple message container with pack/unpack"""
-    def __init__(self, type_val: int, module_id: str, mod_type: str = "", io_id: str = "", payload: Optional[Dict] = None):
-        self.type = type_val
-        self.module_id = module_id
-        self.mod_type = mod_type
-        self.io_id = io_id
-        self.payload = payload or {}
+class ProtocolMessageType(IntEnum):
+    INITIATE = 1
+    CANCEL = 2
+    COMPATIBLE = 3
+    CONNECT = 4
+    SHOW_CONNECTED = 5
 
-    def pack(self) -> bytes:
-        payload_json = json.dumps(self.payload).encode('utf-8')
-        payload_len = len(payload_json)
+    STATE_INQUIRY = 10
+    STATE_RESPONSE = 11
 
-        # !BBBB = 4 bytes: type + 3 x 1-byte lengths
-        header = struct.pack("!BBBB",
-                             self.type,
-                             len(self.module_id),
-                             len(self.mod_type),
-                             len(self.io_id))
+    CAPABILITIES_INQUIRY = 12      # ← NEW – this was missing
+    CAPABILITIES_RESPONSE = 13     # ← shifted from 12 to avoid overlap
 
-        body = (self.module_id + self.mod_type + self.io_id).encode('utf-8') + payload_json
-
-        return header + struct.pack("!H", payload_len) + body
-        
-
-    @staticmethod
-    def unpack(data: bytes) -> 'ProtocolMessage':
-        if len(data) < 6:
-            return ProtocolMessage(0, "bad", "", "", {})
-
-        offset = 0
-
-        type_val = data[offset]
-        offset += 1
-        mod_len  = data[offset]
-        offset += 1
-        type_len = data[offset]
-        offset += 1
-        io_len   = data[offset]
-        offset += 1
-
-        def safe_read(length: int) -> str:
-            nonlocal offset
-            end = offset + length
-            if end > len(data):
-                chunk = data[offset:]
-                offset += length
-            else:
-                chunk = data[offset:end]
-                offset = end
-            return chunk.decode('utf-8', errors='replace')
-
-        module_id = safe_read(mod_len)
-        mod_type  = safe_read(type_len)
-        io_id     = safe_read(io_len)
-
-        payload = {}
-        if offset + 2 <= len(data):
-            payload_len = struct.unpack("!H", data[offset:offset+2])[0]
-            offset += 2
-            if offset + payload_len <= len(data):
-                try:
-                    payload = json.loads(data[offset:offset+payload_len])
-                except:
-                    pass
-
-        return ProtocolMessage(type_val, module_id, mod_type, io_id, payload)
-        
-class ProtocolMessageType(Enum):
-    INITIATE = auto()
-    CANCEL = auto()
-    COMPATIBLE = auto()
-    SHOW_CONNECTED = auto()
-    PATCH_RESTORE = auto()
-    STATE_INQUIRY = auto()
-    STATE_RESPONSE = auto()
-    CAPABILITIES_INQUIRY = auto()      # ← ADD THIS LINE
-    CAPABILITIES_RESPONSE = auto()     # ← AND THIS ONE
+    PATCH_RESTORE = 20
 
 class LedState(Enum):
     OFF = 0
     SOLID = 1
     BLINK_SLOW = 2
     BLINK_RAPID = 3
+
+# ===================================================================
+# IO TYPE ENUM — single byte on the wire
+# ===================================================================
+
+class IOType(IntEnum):
+    UNKNOWN  = 0x00
+    CV       = 0x01
+    AUDIO    = 0x02
+    GATE     = 0x03
+    TRIGGER  = 0x04
+    CLOCK    = 0x05
+    MIDI     = 0x06
+    OSC_MSG   = 0x07   # renamed to avoid clash with built-in "osc"
+
+    @classmethod
+    def from_string(cls, s: str) -> 'IOType':
+        mapping = {
+            "cv":      cls.CV,
+            "audio":   cls.AUDIO,
+            "gate":    cls.GATE,
+            "trigger": cls.TRIGGER,
+            "clock":   cls.CLOCK,
+            "midi":    cls.MIDI,
+            "osc":     cls.OSC_MSG,
+        }
+        return mapping.get(s.lower(), cls.UNKNOWN)
+
+    def __str__(self) -> str:
+        return self.name.lower()
+
+
+class ProtocolMessage:
+    """
+    Wire format (9-byte fixed header):
+        B  H  B  H  H
+        type | mod_len | io_type | io_len | payload_len
+    """
+    def __init__(
+        self,
+        type_val: int,
+        module_id: str,
+        io_type: Any = IOType.UNKNOWN,
+        io_id: str = "",
+        payload: Optional[Dict[str, Any]] = None,
+        mod_type: Any = None,                    # <-- NEW: accept old calls
+    ):
+        self.type = int(type_val) & 0xFF
+        self.module_id = str(module_id)
+
+        # Support both old code (mod_type="cv") and new code (io_type=IOType.CV)
+        source = mod_type if mod_type is not None else io_type
+
+        if isinstance(source, str):
+            self.io_type = int(IOType.from_string(source))
+        elif isinstance(source, IOType):
+            self.io_type = int(source)
+        else:
+            self.io_type = int(source) & 0xFF
+
+        self.io_id = str(io_id)
+        self.payload = payload or {}
+
+    # ------------------------------------------------------------------
+    def pack(self) -> bytes:
+        payload_json = json.dumps(self.payload, separators=(',', ':')).encode('utf-8')
+        payload_len = len(payload_json)
+
+        header = struct.pack(
+            "!BHBHH",                     # 1+2+1+2+2 = 8 bytes
+            self.type,
+            len(self.module_id),
+            self.io_type,                 # single byte enum
+            len(self.io_id),
+            payload_len
+        )
+
+        body = (
+            self.module_id.encode('utf-8') +
+            self.io_id.encode('utf-8') +
+            payload_json
+        )
+        return header + body
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def unpack(data: bytes) -> 'ProtocolMessage':
+        if len(data) < 8:
+            return ProtocolMessage(0, "bad", IOType.UNKNOWN, "")
+
+        try:
+            (msg_type,
+             mod_len,
+             io_type_byte,
+             io_len,
+             payload_len) = struct.unpack("!BHBHH", data[:8])
+        except struct.error:
+            return ProtocolMessage(0, "bad_hdr", IOType.UNKNOWN, "")
+
+        offset = 8
+
+        def read_str(length: int) -> str:
+            nonlocal offset
+            end = offset + length
+            if end > len(data):
+                s = data[offset:]
+                offset = len(data)
+            else:
+                s = data[offset:end]
+                offset = end
+            return s.decode('utf-8', errors='replace')
+
+        module_id = read_str(mod_len)
+        io_id     = read_str(io_len)
+
+        payload = {}
+        if payload_len and offset + payload_len <= len(data):
+            try:
+                payload = json.loads(data[offset:offset + payload_len])
+            except json.JSONDecodeError:
+                pass
+
+        return ProtocolMessage(
+            type_val=msg_type,
+            module_id=module_id,
+            io_type=io_type_byte,
+            io_id=io_id,
+            payload=payload
+        )
+
+    # ------------------------------------------------------------------
+    def __repr__(self) -> str:
+        try:
+            typ_name = ProtocolMessageType(self.type).name
+        except Exception:
+            typ_name = str(self.type)
+        return (f"Msg({typ_name} mod={self.module_id} "
+                f"io_type={IOType(self.io_type)} io={self.io_id} "
+                f"payload_keys={list(self.payload.keys()) if self.payload else None})")
+                
+
 
 class ConnectionRecord:
     __slots__ = ("src", "src_io", "mcast_group", "block_offset", "block_size")

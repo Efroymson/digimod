@@ -361,6 +361,75 @@ class Module:
             except Exception as e:
                 logger.debug(f"[{self.module_id}] recv error: {e}")
 
+    def get_capabilities(self) -> dict:
+        """Return everything the control panel needs to know about this module."""
+        return {
+            "module_id": self.module_id,
+            "module_type": self.type,
+            "unicast_ip": self.unicast_ip,           # ← critical for unicast restore
+            "inputs": self.inputs,
+            "outputs": self.outputs,
+            "controls": list(self.knob_sliders.keys()),
+            # optional but nice:
+            "mcast_group": self.mcast_group,
+            "firmware": "1.0",  # or whatever version you want
+        }
+    def get_state(self) -> dict:
+        connections = {}
+        for io_id, conn in self.input_connections.items():
+            if conn:
+                connections[io_id] = {
+                    "src_mod": conn.src,
+                    "src_io": conn.src_io,
+                    "mcast_group": conn.mcast_group,
+                    "offset": conn.block_offset,
+                    "block_size": conn.block_size,
+                }
+            else:
+                connections[io_id] = None
+
+        return {
+            "module_id": self.module_id,
+            "module_type": self.type,
+            "unicast_ip": self.unicast_ip,
+            "controls": {
+                name: slider.var.get()
+                for name, slider in self.knob_sliders.items()
+            },
+            "connections": connections,
+        }
+        
+    def restore_state(self, state: dict):
+        # Restore controls
+        for name, value in state.get("controls", {}).items():
+            if name in self.knob_sliders:
+                self.knob_sliders[name].restore(value)
+
+        # Restore connections
+        for io_id, conn_info in state.get("connections", {}).items():
+            if not conn_info or io_id not in self.input_jacks:
+                continue
+
+            # Re-create the connection exactly as if user clicked
+            jack = self.input_jacks[io_id]
+            jack.connected_src = conn_info["src_mod"]
+            jack.connected_src_io = conn_info["src_io"]
+            jack.connected_mcast = conn_info["mcast_group"]
+            jack.connected_offset = conn_info["offset"]
+            jack.connected_block_size = conn_info["block_size"]
+
+            # Start receiving
+            self._start_receiver(
+                io_id,
+                conn_info["mcast_group"],
+                conn_info["offset"],
+                conn_info["block_size"]
+            )
+
+            # Update LED
+            jack.state = InputState.IIdleConnected
+            jack._set_led()
+            
     def handle_incoming_msg(self, msg: ProtocolMessage):
         logger.debug(f"[{self.module_id}] Handling {ProtocolMessageType(msg.type).name} from {msg.module_id}:{msg.io_id}")
     
@@ -393,14 +462,52 @@ class Module:
                 self.sock.sendto(resp.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
                 logger.info(f"[{self.module_id}] Sent STATE_RESPONSE")
         
-        if msg.type == ProtocolMessageType.PATCH_RESTORE.value:
+        elif msg.type == ProtocolMessageType.PATCH_RESTORE.value:
             payload = msg.payload
-            target = payload.get("target_mod")
-            if not target or target == self.module_id:
-                data = payload.get("payload", payload) if isinstance(payload, dict) else payload
-                if isinstance(data, dict):
-                    self.iterate_for_restore(data)
-            logger.debug(f"[{self.module_id}] PATCH_RESTORE processed")
+            if not isinstance(payload, dict):
+                return
+            state = payload.get("state", payload)
+            if not isinstance(state, dict):
+                return
+
+            # 1. Restore controls
+            for name, value in state.get("controls", {}).items():
+                if name in self.knob_sliders:
+                    self.knob_sliders[name].restore(value)
+
+            # 2. Restore connections
+            for io_id, conn_info in state.get("connections", {}).items():
+                if not conn_info:
+                    # Disconnected
+                    if io_id in self.input_jacks:
+                        self.input_jacks[io_id].state = InputState.IIdleDisconnected
+                        self.input_jacks[io_id]._set_led()
+                        if io_id in self.input_connections:
+                            self._stop_receiver(io_id)
+                            self.input_connections[io_id] = None
+                    continue
+
+                if io_id not in self.input_jacks:
+                    continue
+
+                jack = self.input_jacks[io_id]
+                jack.connected_src        = conn_info["src_mod"]
+                jack.connected_src_io     = conn_info["src_io"]
+                jack.connected_mcast      = conn_info["mcast_group"]
+                jack.connected_offset     = conn_info.get("offset", 0)
+                jack.connected_block_size = conn_info.get("block_size", 96)
+
+                self._start_receiver(io_id,
+                                   conn_info["mcast_group"],
+                                   conn_info.get("offset", 0),
+                                   conn_info.get("block_size", 96))
+
+                self.input_connections[io_id] = ConnectionRecord(**conn_info)
+
+                jack.state = InputState.IIdleConnected
+                jack._set_led()
+
+            logger.info(f"[{self.module_id}] Patch restored via unicast")
             
 
         if msg.module_id == "mcu":

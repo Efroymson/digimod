@@ -11,6 +11,7 @@ from osc_module import OscModule
 from lfo_module import LfoModule
 from audio_out_module import AudioOutModule
 from module import ProtocolMessage, ProtocolMessageType, CONTROL_MULTICAST, UDP_CONTROL_PORT
+from patch_manager import PatchManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,9 +26,9 @@ class MainApp:
         self.saved_states = []
         self.patch_memory = [[] for _ in range(5)]
         self.patch_slot_var = tk.IntVar(value=0)
+        self._setup_listener()
 
         self._setup_gui()
-        self._setup_listener()
 
     def _setup_gui(self):
         frame = ttk.Frame(self.root, padding="10")
@@ -59,8 +60,17 @@ class MainApp:
         self.log_text.configure(yscrollcommand=scrollbar.set)
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
+        
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.patch_manager = PatchManager(self.sock, self._log)
+
+    def save_to_slot(self):
+        slot = self.patch_slot_var.get()
+        self.patch_manager.save_patch(slot, self.collected_states)
+
+    def load_from_slot(self):
+        slot = self.patch_slot_var.get()
+        self.patch_manager.load_patch(slot)
 
     def _setup_listener(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
