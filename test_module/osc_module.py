@@ -73,7 +73,8 @@ class OscModule(Module):
             self.root, "audio", "Audio Out",
             short_press_callback=self.output_jacks["audio"].short_press,  # ← no ()
             long_press_callback=self.output_jacks["audio"].long_press,
-            verbose_text=True
+            verbose_text=True,
+            is_output=True,
         )
         self.gui_leds["audio"].pack(pady=8)
 

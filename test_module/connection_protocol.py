@@ -396,7 +396,9 @@ class InputJack:
             block_size=self.connected_block_size,
         )
         self.module.input_connections[self.io_id] = rec
-
+        self.state = InputState.IPendingSame
+        print(f"DEBUG: {self.io_id} set to IPendingSame")
+        self._set_led()
         # Start receiving the audio/CV stream
         self.module._start_receiver(
             self.io_id,
@@ -404,6 +406,10 @@ class InputJack:
             self.connected_offset,
             self.connected_block_size,
         )
+        logger.info(f"[{self.module.module_id}] Connection accepted on {self.io_id} from {msg.module_id}:{msg.io_id} mcast={mcast_group}")
+        self.connected_src = msg.module_id
+        self.connected_src_io = msg.io_id
+        logger.debug(f"[{self.module.module_id}] Set connected_src = {self.connected_src}, connected_src_io = {self.connected_src_io}")
         logger.info(f"[{self.module.module_id}] INPUT {self.io_id} CONNECTED to {self.connected_src}:{self.connected_src_io}")
 
     # ------------------------------------------------------------------
@@ -452,8 +458,8 @@ class InputJack:
     def _set_led(self):
         mapping = {
             InputState.IIdleDisconnected: LedState.OFF,
-            InputState.ISelfCompatible: LedState.BLINK_SLOW,
-            InputState.IPending: LedState.SOLID,
+            InputState.ISelfCompatible: LedState.SOLID,  # ← Changed from BLINK_SLOW, which may be better         
+            InputState.IPending: LedState.SOLID, 
             InputState.IIdleConnected: LedState.BLINK_RAPID,
             InputState.IOtherPending: LedState.OFF,
             InputState.IPendingSame: LedState.BLINK_SLOW,
@@ -506,39 +512,77 @@ class InputJack:
         self._set_led()
 
     def on_initiate(self, msg: ProtocolMessage):
-        # Ignore our own INITIATE messages
         if msg.module_id == self.module.module_id and msg.io_id == self.io_id:
-            return
+            return  # ignore self
 
-        # Only react when we're waiting for a connection
-        if self.state not in (InputState.ISelfCompatible, InputState.IIdleDisconnected):
-            return
-
-        # Extract offered type from INITIATE payload
         src_type = msg.payload.get("type", "unknown")
+        src_group = msg.payload.get("group", None)
+        src_offset = msg.payload.get("offset", 0)
         my_type = self.module.inputs[self.io_id].get("type", "unknown")
 
-        logger.info(f"INITIATE from {msg.module_id}:{msg.io_id} type='{src_type}' → my type='{my_type}'")
+        current_conn = self.module.input_connections.get(self.io_id)
 
-        if src_type == my_type:
-            # Compatible — go pending
-            self.state = InputState.IPending
-            self.pending_initiator = (msg.module_id, msg.io_id)
-            logger.debug(f"[{self.module.module_id}] {self.io_id} PENDING ← {msg.module_id}:{msg.io_id}")
+        # Type compatibility
+        type_match = (src_type == my_type)
+
+        # Exact connection match (group + offset)
+        exact_match = (current_conn and
+                       current_conn.mcast_group == src_group and
+                       current_conn.block_offset == src_offset)
+
+        if not type_match:
+            # Incompatible type
+            if self.state in (InputState.IIdleDisconnected,
+                              InputState.ISelfCompatible,
+                              InputState.IPending):
+                self.state = InputState.IOtherCompatible
+            else:
+                self.state = InputState.IOtherPending
         else:
-            # Not compatible — reject
-            self.state = InputState.IOtherPending
-            logger.debug(f"[{self.module.module_id}] {self.io_id} REJECTED (type mismatch)")
+            # Compatible type
+            if exact_match:
+                self.state = InputState.IPendingSame
+            elif current_conn:
+                # Same type, different output → stay connected, no highlight
+                self.state = InputState.IIdleConnected
+            else:
+                # No connection yet → ready to connect
+                self.state = InputState.IPending
+
+        # Always store pending data for accept
+        self.pending_initiator = msg.module_id
+        self.pending_initiator_io = msg.io_id
+        self.pending_mcast = src_group
+        self.pending_offset = src_offset
 
         self._set_led()
-
+        logger.info(f"[{self.module.module_id}] {self.io_id} → {self.state} "
+                    f"(type_match={type_match}, exact_match={exact_match})")
+                    
     def on_cancel(self, msg: ProtocolMessage):
-        if self.state in (InputState.IPending, InputState.IPendingSame,
-                          InputState.ISelfCompatible, InputState.IOtherCompatible,
-                          InputState.IOtherPending):
+        # Clear all temporary/pending states
+        if self.state in (InputState.IPending,
+                          InputState.ISelfCompatible,
+                          InputState.IOtherCompatible):
             self.state = InputState.IIdleDisconnected
-            self.pending_initiator = None
-            self._set_led()
+
+        elif self.state == InputState.IPendingSame:
+            # Was highlighting the currently selected output → lose highlight
+            self.state = InputState.IIdleConnected
+
+        elif self.state == InputState.IOtherPending:
+            # Was blocked by type mismatch → back to normal connected
+            self.state = InputState.IIdleConnected
+
+        # IIdleConnected stays IIdleConnected — do nothing
+
+        # Always clear pending initiator data
+        self.pending_initiator = None
+        self.pending_initiator_io = None
+        self.pending_mcast = None
+        self.pending_offset = None
+
+        self._set_led()
 
     def on_compatible(self, msg: ProtocolMessage):
         if msg.module_id == self.module.module_id and msg.io_id == self.io_id:

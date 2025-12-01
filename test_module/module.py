@@ -28,11 +28,14 @@ class JackWidget(tk.Frame):
     def __init__(self, parent, io_id, label,
                  short_press_callback=None,
                  long_press_callback=None,
-                 verbose_text=True):
+                 verbose_text=True,
+                 is_output=False):
         super().__init__(parent, width=80, height=80, bg="gray20", relief="raised", bd=2)
         self.io_id = io_id
         self.short_press_callback = short_press_callback
         self.long_press_callback = long_press_callback
+        self.root = parent.winfo_toplevel()
+        self.is_output = is_output
 
         self.canvas = tk.Canvas(self, width=60, height=60, bg="gray20", highlightthickness=0)
         self.canvas.pack(pady=5)
@@ -59,13 +62,44 @@ class JackWidget(tk.Frame):
 
     def set_state(self, state: LedState):
         colors = {
-            LedState.OFF: "gray30",
-            LedState.SOLID: "#00ff00",
-            LedState.BLINK_SLOW: "#ffff00",
-            LedState.BLINK_RAPID: "#ff0000",
+            LedState.OFF:         "gray30",
+            LedState.SOLID:       "#00ff00" if self.is_output else "#ff0000",
+            LedState.BLINK_SLOW:  "#00ff00" if self.is_output else "#ff0000",
+            LedState.BLINK_RAPID: "#00ff00" if self.is_output else "#ff0000",
         }
-        fill_color = colors.get(state, "gray50")
+        fill_color = colors[state]
+
+        if state in (LedState.BLINK_SLOW, LedState.BLINK_RAPID):
+            # existing blink logic
+            self.current_state = state
+            self.blink_on = True
+            self._blink()
+        else:
+            self.canvas.itemconfig(self.rect, fill=fill_color)
+            self.current_state = state
+            
+    def _blink(self):
+        if self.current_state not in (LedState.BLINK_SLOW, LedState.BLINK_RAPID):
+            return
+
+        # ONE SOURCE OF TRUTH — define delay first
+        if self.current_state == LedState.BLINK_SLOW:
+            delay = 600    # calm, visible pulse
+        else:  # BLINK_RAPID
+            delay = 180    # fast but not "thin" — feels solid
+
+        # Debug print — now safe
+        print(f"BLINK {self.io_id} | state={self.current_state.name} | on={self.blink_on} | delay={delay}ms")
+
+        # Toggle
+        self.blink_on = not self.blink_on
+
+        base_color = "#00ff00" if self.is_output else "#ff0000"
+        fill_color = base_color if self.blink_on else "gray30"
         self.canvas.itemconfig(self.rect, fill=fill_color)
+
+        # Schedule next
+        self.root.after(delay, self._blink)
         
 
 def derive_mcast_group(unicast_ip: str) -> str:
