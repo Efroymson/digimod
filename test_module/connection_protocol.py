@@ -108,15 +108,24 @@ class OutputJack:
             self._set_led()
 
     def on_show_connected(self, msg: ProtocolMessage):
-        if msg.io_id == self.io_id and msg.module_id == self.module.module_id:
-            # Flash 3× rapid
-            for i in range(6):
-                on = (i % 2 == 0)
-                self.module.root.after(100 * i,
-                    lambda on=on: self.module._queue_led_update(self.io_id,
-                        LedState.BLINK_RAPID if on else LedState.OFF))
-            self.module.root.after(600, lambda: self._set_led())
-    
+        logger.debug(f"[{self.module.module_id}] on_show_connected called with payload: {msg.payload}")
+        target_mod = msg.payload.get("target_mod")
+        target_io = msg.payload.get("target_io")
+        if target_mod == self.module.module_id and target_io == self.io_id:
+            logger.info(f"[{self.module.module_id}] FLASHING {self.io_id} for REVEAL from {target_mod}:{target_io}")
+            # Flash 3x rapid (existing logic, with safeguard)
+            def blink(count=6):
+                if count <= 0 or not self.module.root:
+                    self._set_led()  # Revert to normal state
+                    return
+                on = (count % 2 == 0)
+                state = LedState.BLINK_RAPID if on else LedState.OFF
+                self.module._queue_led_update(self.io_id, state)
+                self.module.root.after(150, lambda c=count-1: blink(c))
+            blink()
+        else:
+            logger.debug(f"[{self.module.module_id}] Skipping flash (target {target_mod}:{target_io} != self {self.module.module_id}:{self.io_id})")
+            
     def on_compatible(self, msg: ProtocolMessage):
         # Ignore our own COMPATIBLE message
         if msg.module_id == self.module.module_id and msg.io_id == self.io_id:
@@ -133,19 +142,32 @@ class OutputJack:
         self._set_led()
         
     def on_show_connected(self, msg: ProtocolMessage):
-        """REVEAL: Flash rapidly for 3s if this output is the connected source"""
-        payload = msg.payload or {}
-        if payload.get("src") == self.module.module_id and payload.get("src_io") == self.io_id:
-            logger.info(f"[{self.module.module_id}] REVEAL → flashing {self.io_id} for 3s")
+        target_mod = msg.payload.get("target_mod")
+        target_io = msg.payload.get("target_io")
+        logger.info(
+            f"[{self.module.module_id}] Output {self.io_id} checking REVEAL: "
+            f"target={target_mod}:{target_io} vs self={self.module.module_id}:{self.io_id}"
+        )
+        if target_mod == self.module.module_id and target_io == self.io_id:
+            logger.info(f"[{self.module.module_id}] !!! FLASHING {self.io_id} FOR REVEAL !!!")
+            # your existing flash code...
             self._flash_rapid_3s()
-
+        else:
+            logger.debug(f"[{self.module.module_id}] Output {self.io_id} ignoring REVEAL")
+            
     def _flash_rapid_3s(self):
-        """Temporarily override LED to rapid blink for 3 seconds"""
-        original_state = self.state
-        self.module._queue_led_update(self.io_id, LedState.BLINK_RAPID)
-
-        def revert():
-            if hasattr(self.module, "root") and self.module.root and self.module.root.winfo_exists():
+        logger.info(f"[{self.module.module_id}] Starting 3-second rapid flash on {self.io_id}")
+        def blink(count=8):
+            if count <= 0:
+                self._set_led()
+                return
+            state = LedState.BLINK_RAPID if (count % 2) else LedState.OFF
+            self.module._queue_led_update(self.io_id, state)
+            self.module.root.after(120, blink, count - 1)
+        blink()
+        
+    def revert():
+        if hasattr(self.module, "root") and self.module.root and self.module.root.winfo_exists():
                 self._set_led()
 
         if hasattr(self.module, "root") and self.module.root:
@@ -224,21 +246,21 @@ class InputJack:
 
         # 3. REVEAL – show which output we are connected to
         if self.state == InputState.IIdleConnected:
+            logger.info(f"[{self.module.module_id}] REVEAL requested on input {self.io_id}")
             if self.connected_src and self.connected_src_io:
-                payload = {
-                    "target_mod": self.connected_src,
-                    "target_io":  self.connected_src_io
-                }
-                msg = ProtocolMessage(
-                    ProtocolMessageType.SHOW_CONNECTED.value,
-                    self.module.module_id,
-                    io_id=self.io_id,
-                    payload=payload
+                logger.info(
+                    f"[{self.module.module_id}] SENDING SHOW_CONNECTED → "
+                    f"{self.connected_src}:{self.connected_src_io} (from input {self.io_id})"
                 )
-                self.module.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
-                logger.debug(f"[{self.module.module_id}] REVEAL → {self.connected_src}:{self.connected_src_io}")
+                self.module.send_show_connected(
+                    self.io_id,
+                    self.connected_src,
+                    self.connected_src_io
+                )
+            else:
+                logger.warning(f"[{self.module.module_id}] REVEAL requested but no connection data!")
             return
-
+            
         # 4. Cancel a pending “compatible” search
         if self.state == InputState.ISelfCompatible:
             self.module.send_cancel(self.io_id)

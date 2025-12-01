@@ -107,11 +107,64 @@ class Module:
         msg = ProtocolMessage(ProtocolMessageType.INITIATE.value, self.module_id, self.type, io_id, payload)
         self.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
         logger.info(f"[{self.module_id}] INITIATE → {io_id}")
-
-    def send_cancel(self, io_id: str):
-        msg = ProtocolMessage(ProtocolMessageType.CANCEL.value, self.module_id, self.type, io_id, {})
+        
+    # ------------------------------------------------------------------
+    # Public send helpers — called from InputJack/OutputJack
+    # ------------------------------------------------------------------
+    def send_initiate(self, io_id: str):
+        if io_id not in self.outputs:
+            return
+        info = self.outputs[io_id]
+        payload = {
+            "group": info.get("group", self.mcast_group),
+            "type": info.get("type", "unknown"),
+            "offset": 0,
+            "block_size": 96
+        }
+        msg = ProtocolMessage(
+            ProtocolMessageType.INITIATE.value,
+            self.module_id,
+            self.type,
+            io_id,
+            payload
+        )
         self.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
-        logger.info(f"[{self.module_id}] CANCEL → {io_id}")
+        logger.info(f"[{self.module_id}] INITIATE sent from {io_id}")
+
+    def send_cancel(self, io_id: str = ""):
+        msg = ProtocolMessage(ProtocolMessageType.CANCEL.value, self.module_id, io_id=io_id)
+        self.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+        logger.info(f"[{self.module_id}] CANCEL sent (io: {io_id or 'all'})")
+
+    def send_compatible(self, io_id: str):
+        if io_id not in self.inputs:
+            return
+        info = self.inputs[io_id]
+        payload = {"type": info.get("type", "unknown")}
+        msg = ProtocolMessage(
+            ProtocolMessageType.COMPATIBLE.value,
+            self.module_id,
+            self.type,
+            io_id,
+            payload
+        )
+        self.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+        logger.info(f"[{self.module_id}] COMPATIBLE sent from input {io_id} type={info.get('type')}")
+
+    def send_show_connected(self, io_id: str, target_mod: str, target_io: str):
+        payload = {
+            "target_mod": target_mod,
+            "target_io": target_io
+        }
+        msg = ProtocolMessage(
+            ProtocolMessageType.SHOW_CONNECTED.value,
+            self.module_id,
+            io_id=io_id,
+            payload=payload
+        )
+        logger.info(f"[{self.module_id}] →→→ BROADCASTING SHOW_CONNECTED for {target_mod}:{target_io}")
+        self.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+        
         
     def _notify_self_compatible(self, input_io_id: str):
         msg = ProtocolMessage(
@@ -238,16 +291,26 @@ class Module:
                 logger.debug(f"[{self.module_id}] recv error: {e}")
 
     def handle_incoming_msg(self, msg: ProtocolMessage):
+        logger.debug(f"[{self.module_id}] Handling {ProtocolMessageType(msg.type).name} from {msg.module_id}:{msg.io_id}")
+    
+        # Existing jack iterations for INITIATE/CANCEL/COMPATIBLE...
         for jack in list(self.input_jacks.values()) + list(self.output_jacks.values()):
             if msg.type == ProtocolMessageType.INITIATE.value:
                 jack.on_initiate(msg)
             elif msg.type == ProtocolMessageType.CANCEL.value:
                 jack.on_cancel(msg)
             elif msg.type == ProtocolMessageType.COMPATIBLE.value:
-                if isinstance(jack, OutputJack):   # ← ONLY output jacks process COMPATIBLE
+                if isinstance(jack, OutputJack):
                     jack.on_compatible(msg)
-            elif msg.type == ProtocolMessageType.SHOW_CONNECTED.value and hasattr(jack, "on_show_connected"):
+
+        if msg.type == ProtocolMessageType.SHOW_CONNECTED.value:
+            logger.info(
+                f"[{self.module_id}] ←←← RECEIVED SHOW_CONNECTED from {msg.module_id}:{msg.io_id} "
+                f"targeting {msg.payload.get('target_mod')}:{msg.payload.get('target_io')}"
+            )
+            for jack in self.output_jacks.values():
                 jack.on_show_connected(msg)
+
 
         if msg.type == ProtocolMessageType.PATCH_RESTORE.value:
             payload = msg.payload
@@ -256,6 +319,8 @@ class Module:
                 data = payload.get("payload", payload) if isinstance(payload, dict) else payload
                 if isinstance(data, dict):
                     self.iterate_for_restore(data)
+            logger.debug(f"[{self.module_id}] PATCH_RESTORE processed")
+            
 
         if msg.module_id == "mcu":
             if msg.type == ProtocolMessageType.STATE_INQUIRY.value:
