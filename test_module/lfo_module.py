@@ -51,7 +51,7 @@ class LfoModule(Module):
             self.root, "cv", "CV Out",
             short_press_callback=self.output_jacks["cv"].short_press,
             long_press_callback=self.output_jacks["cv"].long_press,
-            verbose_text=False
+            verbose_text=True
         )
         self.gui_leds["cv"].pack(pady=10)
 

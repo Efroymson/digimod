@@ -4,6 +4,8 @@
 # No shared pending_initiator, no crosstalk, no race conditions
 
 import logging
+import json
+import struct
 from enum import Enum, auto
 from typing import Optional, Dict, Any
 
@@ -46,34 +48,60 @@ class ProtocolMessage:
     def pack(self) -> bytes:
         payload_json = json.dumps(self.payload).encode('utf-8')
         payload_len = len(payload_json)
-        header = struct.pack("!BBHH", 
-                           self.type, 
-                           len(self.module_id), 
-                           len(self.mod_type), 
-                           len(self.io_id))
-        body = self.module_id.encode('utf-8') + \
-               self.mod_type.encode('utf-8') + \
-               self.io_id.encode('utf-8') + \
-               payload_json
+
+        # !BBBB = 4 bytes: type + 3 x 1-byte lengths
+        header = struct.pack("!BBBB",
+                             self.type,
+                             len(self.module_id),
+                             len(self.mod_type),
+                             len(self.io_id))
+
+        body = (self.module_id + self.mod_type + self.io_id).encode('utf-8') + payload_json
+
         return header + struct.pack("!H", payload_len) + body
+        
 
     @staticmethod
     def unpack(data: bytes) -> 'ProtocolMessage':
-        if len(data) < 8:
-            raise ValueError("Too short")
-        type_val, mod_len, type_len, io_len = struct.unpack("!BBHH", data[:6])
-        offset = 6
-        module_id = data[offset:offset+mod_len].decode('utf-8')
-        offset += mod_len
-        mod_type = data[offset:offset+type_len].decode('utf-8')
-        offset += type_len
-        io_id = data[offset:offset+io_len].decode('utf-8')
-        offset += io_len
-        payload_len = struct.unpack("!H", data[offset:offset+2])[0]
-        offset += 2
+        if len(data) < 6:
+            return ProtocolMessage(0, "bad", "", "", {})
+
+        offset = 0
+
+        type_val = data[offset]
+        offset += 1
+        mod_len  = data[offset]
+        offset += 1
+        type_len = data[offset]
+        offset += 1
+        io_len   = data[offset]
+        offset += 1
+
+        def safe_read(length: int) -> str:
+            nonlocal offset
+            end = offset + length
+            if end > len(data):
+                chunk = data[offset:]
+                offset += length
+            else:
+                chunk = data[offset:end]
+                offset = end
+            return chunk.decode('utf-8', errors='replace')
+
+        module_id = safe_read(mod_len)
+        mod_type  = safe_read(type_len)
+        io_id     = safe_read(io_len)
+
         payload = {}
-        if payload_len > 0:
-            payload = json.loads(data[offset:offset+payload_len].decode('utf-8'))
+        if offset + 2 <= len(data):
+            payload_len = struct.unpack("!H", data[offset:offset+2])[0]
+            offset += 2
+            if offset + payload_len <= len(data):
+                try:
+                    payload = json.loads(data[offset:offset+payload_len])
+                except:
+                    pass
+
         return ProtocolMessage(type_val, module_id, mod_type, io_id, payload)
         
 class ProtocolMessageType(Enum):
@@ -81,10 +109,11 @@ class ProtocolMessageType(Enum):
     CANCEL = auto()
     COMPATIBLE = auto()
     SHOW_CONNECTED = auto()
-    CONNECTED = auto()           # optional, if you ever use it
     PATCH_RESTORE = auto()
     STATE_INQUIRY = auto()
     STATE_RESPONSE = auto()
+    CAPABILITIES_INQUIRY = auto()      # ← ADD THIS LINE
+    CAPABILITIES_RESPONSE = auto()     # ← AND THIS ONE
 
 class LedState(Enum):
     OFF = 0
@@ -138,17 +167,21 @@ class OutputJack:
     def _send_initiate(self):
         info = self.module.outputs[self.io_id]
         payload = {
-            "group": info.get("group", self.module.mcast_group),
             "type": info.get("type", "unknown"),
-            "offset": 0,
-            "block_size": 96
+            "group": info.get("group", self.module.mcast_group),
+            "offset": info.get("offset", 0),
+            "block_size": info.get("block_size", 96)
         }
         msg = ProtocolMessage(
             ProtocolMessageType.INITIATE.value,
-            self.module.module_id, self.module.type, self.io_id, payload
+            self.module.module_id,
+            mod_type=self.module.type,
+            io_id=self.io_id,
+            payload=payload
         )
         self.module.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
-        logger.info(f"[{self.module.module_id}] INITIATE sent from {self.io_id}")
+        logger.info(f"[{self.module.module_id}] INITIATE sent from {self.io_id} → {payload['group']} "
+                    f"offset={payload['offset']} size={payload['block_size']}")
 
     def on_initiate(self, msg: ProtocolMessage):
         # Ignore our own INITIATE message

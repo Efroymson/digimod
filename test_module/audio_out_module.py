@@ -44,8 +44,6 @@ class AudioOutModule(Module):
         # 3. Initialize connection states (must come after inputs/outputs defined)
         # self._init_connection_states()
         # self._sync_initial_leds()
-        self._ensure_io_defs()          # ← NEW
-        self._refresh_gui_from_controls()   # ← now comes from ConnectionProtocol
         self._update_display()
         if self.root:
             self.root.update_idletasks()
@@ -53,15 +51,21 @@ class AudioOutModule(Module):
     def _setup_gui(self, parent_root):
         self.root = tk.Toplevel(parent_root) if parent_root else tk.Tk()
         self.root.title(f"Audio Out {self.module_id}")
-        self.gui_leds["left"] = JackWidget(self.root, "left", "Left Input",
-                                           short_press_callback=self.connect_input,
-                                           long_press_callback=self.long_press_input,
-                                           verbose_text=False)
+
+        self.gui_leds["left"] = JackWidget(
+           self.root, "left", "Left Input",
+           short_press_callback=self.input_jacks["left"].short_press,   # ← FIXED
+           long_press_callback=self.input_jacks["left"].long_press,
+           verbose_text=True
+       )
         self.gui_leds["left"].pack(pady=5)
-        self.gui_leds["right"] = JackWidget(self.root, "right", "Right Input",
-                                            short_press_callback=self.connect_input,
-                                            long_press_callback=self.long_press_input,
-                                            verbose_text=False)
+
+        self.gui_leds["right"] = JackWidget(
+           self.root, "right", "Right Input",
+           short_press_callback=self.input_jacks["right"].short_press,  # ← FIXED
+           long_press_callback=self.input_jacks["right"].long_press,
+           verbose_text=True
+       )
         self.gui_leds["right"].pack(pady=5)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 

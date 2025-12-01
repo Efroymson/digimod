@@ -17,11 +17,8 @@ from connection_protocol import (
     LedState, ConnectionRecord,
     CONTROL_MULTICAST, UDP_CONTROL_PORT, UDP_AUDIO_PORT
 )
-# ------------------------------------------------------------------
-# Constants & ProtocolMessage — MOVED HERE from base_module.py
-# ------------------------------------------------------------------
 
-
+logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------
@@ -39,9 +36,10 @@ class JackWidget(tk.Frame):
 
         self.canvas = tk.Canvas(self, width=60, height=60, bg="gray20", highlightthickness=0)
         self.canvas.pack(pady=5)
-        self.circle = self.canvas.create_oval(10, 10, 50, 50, fill="gray50", outline="white")
+        self.rect = self.canvas.create_rectangle(10, 10, 50, 50, fill="gray50", outline="white", width=2)
+
         if verbose_text:
-            tk.Label(self, text=label, fg="white", bg="gray20").pack()
+            tk.Label(self, text=label, fg="white", bg="gray20", font=("Helvetica", 9)).pack()
 
         self.press_time = 0
         self.bind("<ButtonPress-1>", self._on_press)
@@ -66,9 +64,9 @@ class JackWidget(tk.Frame):
             LedState.BLINK_SLOW: "#ffff00",
             LedState.BLINK_RAPID: "#ff0000",
         }
-        self.canvas.itemconfig(self.circle, fill=colors.get(state, "gray50"))
+        fill_color = colors.get(state, "gray50")
+        self.canvas.itemconfig(self.rect, fill=fill_color)
         
-logger = logging.getLogger(__name__)
 
 def derive_mcast_group(unicast_ip: str) -> str:
     parts = unicast_ip.split('.')
@@ -385,6 +383,16 @@ class Module:
                 jack.on_show_connected(msg)
 
 
+        if msg.type == ProtocolMessageType.STATE_INQUIRY.value and msg.module_id == "mcu":
+                state = self.get_state()  # your existing method
+                resp = ProtocolMessage(
+                    ProtocolMessageType.STATE_RESPONSE.value,
+                    self.module_id,
+                    payload=state
+                )
+                self.sock.sendto(resp.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+                logger.info(f"[{self.module_id}] Sent STATE_RESPONSE")
+        
         if msg.type == ProtocolMessageType.PATCH_RESTORE.value:
             payload = msg.payload
             target = payload.get("target_mod")

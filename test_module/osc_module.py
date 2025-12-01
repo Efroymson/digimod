@@ -64,7 +64,7 @@ class OscModule(Module):
             self.root, "fm", "FM In",
             short_press_callback=self.input_jacks["fm"].short_press,   # ← no ()
             long_press_callback=self.input_jacks["fm"].long_press,
-            verbose_text=False
+            verbose_text=True
         )
         self.gui_leds["fm"].pack(pady=8)
 
@@ -73,7 +73,7 @@ class OscModule(Module):
             self.root, "audio", "Audio Out",
             short_press_callback=self.output_jacks["audio"].short_press,  # ← no ()
             long_press_callback=self.output_jacks["audio"].long_press,
-            verbose_text=False
+            verbose_text=True
         )
         self.gui_leds["audio"].pack(pady=8)
 
