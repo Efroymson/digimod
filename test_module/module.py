@@ -89,7 +89,7 @@ class JackWidget(tk.Frame):
             delay = 180    # fast but not "thin" — feels solid
 
         # Debug print — now safe
-        print(f"BLINK {self.io_id} | state={self.current_state.name} | on={self.blink_on} | delay={delay}ms")
+        #print(f"BLINK {self.io_id} | state={self.current_state.name} | on={self.blink_on} | delay={delay}ms")
 
         # Toggle
         self.blink_on = not self.blink_on

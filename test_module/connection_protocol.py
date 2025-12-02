@@ -361,99 +361,95 @@ class OutputJack:
 
 class InputJack:
     def __init__(self, io_id: str, module):
-        self.io_id = io_id
-        self.module = module
-        self.state = InputState.IIdleDisconnected
-        self.type_ = module.inputs[io_id].get("type", "unknown")
-
-        # <<< THESE ARE THE ONLY NEW FIELDS >>>
-        self.connected_src: Optional[str] = None          # e.g. "lfo_0"
-        self.connected_src_io: Optional[str] = None       # e.g. "cv"
-        self.connected_mcast: Optional[str] = None
-        self.connected_offset: Optional[int] = None
-        self.connected_block_size: Optional[int] = None
-        # <<< END NEW FIELDS >>>
-
-        self._set_led()
+            self.io_id = io_id
+            self.module = module
+            self.state = InputState.IIdleDisconnected
+            self.connected_to: Optional[ConnectionRecord] = None  # single source of truth
+            self.type_ = module.inputs[io_id].get("type", "unknown")
+            self._set_led()
 
     # ------------------------------------------------------------------
     #  ACCEPT A PENDING CONNECTION (called both from live use and restore)
     # ------------------------------------------------------------------
-    def _accept_connection(self, msg: ProtocolMessage):
-        payload = msg.payload
-        self.connected_src = msg.module_id
-        self.connected_src_io = msg.io_id
-        self.connected_mcast = payload.get("group", self.module.mcast_group)
-        self.connected_offset = payload.get("offset", 0)
-        self.connected_block_size = payload.get("block_size", 96)
-
-        # Keep ConnectionRecord in sync (used by save/restore)
-        rec = ConnectionRecord(
-            src=self.connected_src,
-            src_io=self.connected_src_io,          # <-- important for REVEAL
-            mcast_group=self.connected_mcast,
-            block_offset=self.connected_offset,
-            block_size=self.connected_block_size,
+    def _accept_connection(self):
+        """
+        Called when user clicks an input in IPending state.
+        Final, perfect version: single source of truth on the jack.
+        """
+        # ONE SOURCE OF TRUTH — the jack owns its connection
+        self.connected_to = ConnectionRecord(
+            src=self.pending_initiator,
+            src_io=self.pending_initiator_io,
+            mcast_group=self.pending_mcast,
+            block_offset=self.pending_offset,
+            block_size=96,
         )
-        self.module.input_connections[self.io_id] = rec
+
+        # Mirror to module for routing and save/restore
+        self.module.input_connections[self.io_id] = self.connected_to
+
+        # Visual state
         self.state = InputState.IPendingSame
-        print(f"DEBUG: {self.io_id} set to IPendingSame")
-        self._set_led()
-        # Start receiving the audio/CV stream
+        logger.info(
+            f"[{self.module.module_id}] Connection ACCEPTED on {self.io_id} "
+            f"← {self.connected_to.src}:{self.connected_to.src_io} "
+            f"({self.connected_to.mcast_group}:{self.connected_to.block_offset})"
+        )
+
+        # Start receiving audio/CV
         self.module._start_receiver(
             self.io_id,
-            self.connected_mcast,
-            self.connected_offset,
-            self.connected_block_size,
+            self.connected_to.mcast_group,
+            self.connected_to.block_offset,
+            self.connected_to.block_size,
         )
-        logger.info(f"[{self.module.module_id}] Connection accepted on {self.io_id} from {msg.module_id}:{msg.io_id} mcast={mcast_group}")
-        self.connected_src = msg.module_id
-        self.connected_src_io = msg.io_id
-        logger.debug(f"[{self.module.module_id}] Set connected_src = {self.connected_src}, connected_src_io = {self.connected_src_io}")
-        logger.info(f"[{self.module.module_id}] INPUT {self.io_id} CONNECTED to {self.connected_src}:{self.connected_src_io}")
 
+        # Update GUI immediately
+        # Force immediate GUI update — no method needed
+        self._set_led()      
+
+        # Clear pending data
+        self.pending_initiator = None
+        self.pending_initiator_io = None
+        self.pending_mcast = None
+        self.pending_offset = None
+
+        print(f"DEBUG: {self.io_id} → IPendingSame (slow blink)")
     # ------------------------------------------------------------------
     #  USER PRESS (short press)
     # ------------------------------------------------------------------
     def short_press(self, io_id=None):
-        # 1. Start looking for a compatible output
+        # 1. Disconnected → start advertising compatibility
         if self.state == InputState.IIdleDisconnected:
+            logger.info(f"[{self.module.module_id}] Input {self.io_id} short press — advertising compatibility")
             self.module.send_compatible(self.io_id)
             self.state = InputState.ISelfCompatible
             self._set_led()
             return
 
-        # 2. Accept the blinking output
+        # 2. Pending → accept the connection (this is the real "connect" action)
         if self.state == InputState.IPending:
-            msg = getattr(self.module, "pending_msg", None)
-            if msg:
-                self._accept_connection(msg)
-            self.state = InputState.IIdleConnected
-            self._set_led()
+            logger.info(f"[{self.module.module_id}] Input {self.io_id} short press — ACCEPTING connection from "
+                        f"{self.pending_initiator}:{self.pending_initiator_io}")
+            self._accept_connection()
             return
 
-        # 3. REVEAL – show which output we are connected to
-        if self.state == InputState.IIdleConnected:
+        # 3. Already connected → REVEAL who we're connected to
+        if self.connected_to:
             logger.info(f"[{self.module.module_id}] REVEAL requested on input {self.io_id}")
-            if self.connected_src and self.connected_src_io:
-                logger.info(
-                    f"[{self.module.module_id}] SENDING SHOW_CONNECTED → "
-                    f"{self.connected_src}:{self.connected_src_io} (from input {self.io_id})"
-                )
-                self.module.send_show_connected(
-                    self.io_id,
-                    self.connected_src,
-                    self.connected_src_io
-                )
-            else:
-                logger.warning(f"[{self.module.module_id}] REVEAL requested but no connection data!")
+            logger.info(
+                f"[{self.module.module_id}] SENDING SHOW_CONNECTED → "
+                f"{self.connected_to.src}:{self.connected_to.src_io} (from input {self.io_id})"
+            )
+            self.module.send_show_connected(
+                self.io_id,
+                self.connected_to.src,
+                self.connected_to.src_io
+            )
             return
-            
-        # 4. Cancel a pending “compatible” search
-        if self.state == InputState.ISelfCompatible:
-            self.module.send_cancel(self.io_id)
-            self.state = InputState.IIdleDisconnected
-            self._set_led()
+
+        # 4. Fallback — should never happen, but safe
+        logger.debug(f"[{self.module.module_id}] Input {self.io_id} short press in state {self.state} — no action taken")
 
     def _set_led(self):
         mapping = {
@@ -468,17 +464,20 @@ class InputJack:
         self.module._queue_led_update(self.io_id, mapping[self.state])
 
                 
-    def long_press(self, io_id=None):
+    def long_press(self):
         if self.state == InputState.ISelfCompatible:
-            self.module.send_cancel(self.io_id)
+            logger.info(f"[{self.module.module_id}] Input {self.io_id} long press — canceling advertising")
+            self.module._broadcast_cancel()
             self.state = InputState.IIdleDisconnected
-            self.module._queue_led_update(self.io_id, LedState.OFF)
+            self._set_led()
 
-        elif self.state == InputState.IIdleConnected:
-            if hasattr(self.module, "_stop_receiver"):
-                self.module._stop_receiver(self.io_id)
+        elif self.connected_to:
+            logger.info(f"[{self.module.module_id}] Input {self.io_id} long press — DISCONNECTING")
+            self.connected_to = None
+            self.module.input_connections.pop(self.io_id, None)
+            self.module._stop_receiver(self.io_id)
             self.state = InputState.IIdleDisconnected
-            self.module._queue_led_update(self.io_id, LedState.OFF)
+            self._set_led()
             
     def _send_compatible(self):
         info = self.module.inputs[self.io_id]
@@ -522,42 +521,30 @@ class InputJack:
 
         current_conn = self.module.input_connections.get(self.io_id)
 
-        # Type compatibility
         type_match = (src_type == my_type)
-
-        # Exact connection match (group + offset)
         exact_match = (current_conn and
                        current_conn.mcast_group == src_group and
                        current_conn.block_offset == src_offset)
 
         if not type_match:
-            # Incompatible type
-            if self.state in (InputState.IIdleDisconnected,
-                              InputState.ISelfCompatible,
-                              InputState.IPending):
-                self.state = InputState.IOtherCompatible
-            else:
-                self.state = InputState.IOtherPending
+            self.state = InputState.IOtherPending if current_conn else InputState.IOtherCompatible
+            logger.info(f"[{self.module.module_id}] {self.io_id} → {self.state.name} (type mismatch)")
+        elif exact_match:
+            self.state = InputState.IPendingSame
+            logger.info(f"[{self.module.module_id}] {self.io_id} → {self.state.name} (exact match)")
+        elif current_conn:
+            # Same type, different output → do nothing (CSV: "do nothing")
+            logger.info(f"[{self.module.module_id}] {self.io_id} → unchanged (type match, different output)")
         else:
-            # Compatible type
-            if exact_match:
-                self.state = InputState.IPendingSame
-            elif current_conn:
-                # Same type, different output → stay connected, no highlight
-                self.state = InputState.IIdleConnected
-            else:
-                # No connection yet → ready to connect
-                self.state = InputState.IPending
+            self.state = InputState.IPending
+            logger.info(f"[{self.module.module_id}] {self.io_id} → {self.state.name} (new compatible)")
 
-        # Always store pending data for accept
         self.pending_initiator = msg.module_id
         self.pending_initiator_io = msg.io_id
         self.pending_mcast = src_group
         self.pending_offset = src_offset
 
         self._set_led()
-        logger.info(f"[{self.module.module_id}] {self.io_id} → {self.state} "
-                    f"(type_match={type_match}, exact_match={exact_match})")
                     
     def on_cancel(self, msg: ProtocolMessage):
         # Clear all temporary/pending states
