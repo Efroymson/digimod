@@ -14,7 +14,7 @@ from enum import Enum, auto
 from connection_protocol import (
     InputJack, OutputJack, InputState, OutputState,
     ProtocolMessage, ProtocolMessageType,
-    LedState, ConnectionRecord,
+    LedState, ConnectionRecord, ConnectionProtocol,
     CONTROL_MULTICAST, UDP_CONTROL_PORT, UDP_AUDIO_PORT
 )
 
@@ -138,16 +138,27 @@ class Module:
         self.type = mod_type
         
         self.mcast_group = derive_mcast_group(self.unicast_ip)
-
+        
+        self.is_simulator = self.unicast_ip.startswith("127.") #becasue multicast over loopback is unreliable
+        
+        if self.is_simulator:
+            self.control_group = "255.255.255.255"  # Broadcast for reliable local delivery
+        else:
+            self.control_group = CONTROL_MULTICAST  # Multicast for hardware
+        
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if hasattr(socket, "SO_REUSEPORT"):
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         self.sock.bind(('', UDP_CONTROL_PORT))
-        mreq = struct.pack("4sl", socket.inet_aton(CONTROL_MULTICAST), socket.INADDR_ANY)
-        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)  # ← Critical!
         self.sock.settimeout(0.1)
+        
+        if self.is_simulator:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        else:
+            mreq = struct.pack("4sl", socket.inet_aton(self.control_group), socket.INADDR_ANY)
+            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
         
         # Audio/CV receive socket — FIXED for multicast/loopback
         self.audio_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -157,8 +168,10 @@ class Module:
         self.audio_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)  # ← ADD: Critical for loopback!
         self.audio_socket.bind(('', 5005))  # ← FIXED: Bind to all interfaces (was sometimes unicast_ip)
         self.audio_socket.settimeout(0.01)
-           
-       
+
+        self.connection_protocol = ConnectionProtocol(self)
+        self.connection_protocol.module_id = self.module_id
+        self._ensure_io_defs = self.connection_protocol._ensure_io_defs       
         self.outputs = {}
         self.input_jacks = {}
         self.output_jacks = {}
@@ -175,6 +188,7 @@ class Module:
         self._listener_thread.start()
     
     # new init helpers
+    
     def add_input(self, io_id: str, type_: str, group: str = None):
         self.inputs[io_id] = {"type": type_, "group": group or self.mcast_group}
 
@@ -210,7 +224,7 @@ class Module:
             "block_size": 96
         }
         msg = ProtocolMessage(ProtocolMessageType.INITIATE.value, self.module_id, self.type, io_id, payload)
-        self.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+        self.sock.sendto(msg.pack(), (self.module.control_group, UDP_CONTROL_PORT))
         logger.info(f"[{self.module_id}] INITIATE → {io_id}")
         
     # ------------------------------------------------------------------
@@ -233,12 +247,12 @@ class Module:
             io_id,
             payload
         )
-        self.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+        self.sock.sendto(msg.pack(), (self.module.control_group, UDP_CONTROL_PORT))
         logger.info(f"[{self.module_id}] INITIATE sent from {io_id}")
 
     def send_cancel(self, io_id: str = ""):
         msg = ProtocolMessage(ProtocolMessageType.CANCEL.value, self.module_id, io_id=io_id)
-        self.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+        self.sock.sendto(msg.pack(), (self.module.control_group, UDP_CONTROL_PORT))
         logger.info(f"[{self.module_id}] CANCEL sent (io: {io_id or 'all'})")
 
     def send_compatible(self, io_id: str):
@@ -253,7 +267,7 @@ class Module:
             io_id,
             payload
         )
-        self.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+        self.sock.sendto(msg.pack(), (self.module.control_group, UDP_CONTROL_PORT))
         logger.info(f"[{self.module_id}] COMPATIBLE sent from input {io_id} type={info.get('type')}")
 
     def send_show_connected(self, io_id: str, target_mod: str, target_io: str):
@@ -268,7 +282,7 @@ class Module:
             payload=payload
         )
         logger.info(f"[{self.module_id}] →→→ BROADCASTING SHOW_CONNECTED for {target_mod}:{target_io}")
-        self.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+        self.sock.sendto(msg.pack(), (self.module.control_group, UDP_CONTROL_PORT))
         
         
     def _notify_self_compatible(self, input_io_id: str):
@@ -279,7 +293,7 @@ class Module:
             input_io_id,
             {"type": self.inputs[input_io_id]["type"]}
         )
-        self.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+        self.sock.sendto(msg.pack(), (self.module.control_group, UDP_CONTROL_PORT))
         logger.info(f"[{self.module_id}] COMPATIBLE sent from input {input_io_id}")
 
     # ===================================================================
@@ -385,15 +399,27 @@ class Module:
             pass
 
     def _listen(self):
+        """Background control message listener — raw bytes only."""
         while True:
             try:
-                data, _ = self.sock.recvfrom(4096)
-                msg = ProtocolMessage.unpack(data)
-                threading.Thread(target=self.handle_incoming_msg, args=(msg,), daemon=True).start()
+                data, addr = self.sock.recvfrom(4096)
+
+                # Optional: ignore our own messages to prevent echo loops
+                if addr[0] == self.unicast_ip:
+                    continue
+
+                # CRITICAL FIX: Pass raw bytes, not unpacked message
+                # And do it directly — NO extra thread per packet needed!
+                self.handle_incoming_msg(data)
+
             except socket.timeout:
                 continue
+            except OSError:
+                # Socket closed during shutdown
+                break
             except Exception as e:
-                logger.debug(f"[{self.module_id}] recv error: {e}")
+                logger.exception(f"[{self.module_id}] Control listener error: {e}")
+                
 
     def get_capabilities(self) -> dict:
         """Return everything the control panel needs to know about this module."""
@@ -408,16 +434,18 @@ class Module:
             "mcast_group": self.mcast_group,
             "firmware": "1.0",  # or whatever version you want
         }
+        
     def get_state(self) -> dict:
         connections = {}
-        for io_id, conn in self.input_connections.items():
-            if conn:
+        for io_id, jack in self.input_jacks.items():
+            if jack.connected_to:
+                c = jack.connected_to
                 connections[io_id] = {
-                    "src_mod": conn.src,
-                    "src_io": conn.src_io,
-                    "mcast_group": conn.mcast_group,
-                    "offset": conn.block_offset,
-                    "block_size": conn.block_size,
+                    "src": c.src,
+                    "src_io": c.src_io,
+                    "mcast_group": c.mcast_group,
+                    "block_offset": c.block_offset,
+                    "block_size": c.block_size,
                 }
             else:
                 connections[io_id] = None
@@ -426,130 +454,71 @@ class Module:
             "module_id": self.module_id,
             "module_type": self.type,
             "unicast_ip": self.unicast_ip,
-            "controls": {
-                name: slider.var.get()
-                for name, slider in self.knob_sliders.items()
-            },
+            "controls": {name: s.var.get() for name, s in self.knob_sliders.items()},
             "connections": connections,
         }
         
     def restore_state(self, state: dict):
-        # Restore controls
+        """Restore both controls and connections from saved state."""
+        # 1. Restore controls (already working perfectly)
         for name, value in state.get("controls", {}).items():
             if name in self.knob_sliders:
                 self.knob_sliders[name].restore(value)
 
-        # Restore connections
+        # 2. Restore connections — using the single source of truth
         for io_id, conn_info in state.get("connections", {}).items():
             if not conn_info or io_id not in self.input_jacks:
+                # Explicitly disconnected or unknown jack
+                jack = self.input_jacks.get(io_id)
+                if jack:
+                    jack.connected_to = None
+                    jack.state = InputState.IIdleDisconnected
+                    jack._set_led()
+                    self.input_connections.pop(io_id, None)
+                    self._stop_receiver(io_id)
                 continue
 
-            # Re-create the connection exactly as if user clicked
             jack = self.input_jacks[io_id]
-            jack.connected_src = conn_info["src_mod"]
-            jack.connected_src_io = conn_info["src_io"]
-            jack.connected_mcast = conn_info["mcast_group"]
-            jack.connected_offset = conn_info["offset"]
-            jack.connected_block_size = conn_info["block_size"]
 
-            # Start receiving
+            # ONE SOURCE OF TRUTH — store on the jack
+            jack.connected_to = ConnectionRecord(
+                src=conn_info["src"],           # ← correct field name
+                src_io=conn_info["src_io"],
+                mcast_group=conn_info["mcast_group"],
+                block_offset=conn_info.get("block_offset", 0),
+                block_size=conn_info.get("block_size", 96),
+            )
+
+            # Mirror to module dict (for routing)
+            self.input_connections[io_id] = jack.connected_to
+
+            # Start receiving audio/CV
             self._start_receiver(
                 io_id,
                 conn_info["mcast_group"],
-                conn_info["offset"],
-                conn_info["block_size"]
+                conn_info.get("block_offset", 0),
+                conn_info.get("block_size", 96),
             )
 
-            # Update LED
+            # Visual state
             jack.state = InputState.IIdleConnected
             jack._set_led()
+
+        logger.info(f"[{self.module_id}] Full state restored (controls + connections) restored")
             
-    def handle_incoming_msg(self, msg: ProtocolMessage):
-        logger.debug(f"[{self.module_id}] Handling {ProtocolMessageType(msg.type).name} from {msg.module_id}:{msg.io_id}")
-    
-        # Existing jack iterations for INITIATE/CANCEL/COMPATIBLE...
-        for jack in list(self.input_jacks.values()) + list(self.output_jacks.values()):
-            if msg.type == ProtocolMessageType.INITIATE.value:
-                jack.on_initiate(msg)
-            elif msg.type == ProtocolMessageType.CANCEL.value:
-                jack.on_cancel(msg)
-            elif msg.type == ProtocolMessageType.COMPATIBLE.value:
-                if isinstance(jack, OutputJack):
-                    jack.on_compatible(msg)
+    def handle_incoming_msg(self, data: bytes):
+        """Safely unpack and dispatch incoming control messages."""
+        if not isinstance(data, (bytes, bytearray)):
+            logger.error(f"[{self.module_id}] handle_incoming_msg received non-bytes: {type(data)}")
+            return
 
-        if msg.type == ProtocolMessageType.SHOW_CONNECTED.value:
-            logger.info(
-                f"[{self.module_id}] ←←← RECEIVED SHOW_CONNECTED from {msg.module_id}:{msg.io_id} "
-                f"targeting {msg.payload.get('target_mod')}:{msg.payload.get('target_io')}"
-            )
-            for jack in self.output_jacks.values():
-                jack.on_show_connected(msg)
+        msg = ProtocolMessage.unpack(data)
+        if msg is None:
+            return
 
-
-        if msg.type == ProtocolMessageType.STATE_INQUIRY.value and msg.module_id == "mcu":
-                state = self.get_state()  # your existing method
-                resp = ProtocolMessage(
-                    ProtocolMessageType.STATE_RESPONSE.value,
-                    self.module_id,
-                    payload=state
-                )
-                self.sock.sendto(resp.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
-                logger.info(f"[{self.module_id}] Sent STATE_RESPONSE")
+        # Single source of truth — let the protocol engine handle it
+        self.connection_protocol.handle_msg(msg)
         
-        elif msg.type == ProtocolMessageType.PATCH_RESTORE.value:
-            payload = msg.payload
-            if not isinstance(payload, dict):
-                return
-            state = payload.get("state", payload)
-            if not isinstance(state, dict):
-                return
-
-            # 1. Restore controls
-            for name, value in state.get("controls", {}).items():
-                if name in self.knob_sliders:
-                    self.knob_sliders[name].restore(value)
-
-            # 2. Restore connections
-            for io_id, conn_info in state.get("connections", {}).items():
-                if not conn_info:
-                    # Disconnected
-                    if io_id in self.input_jacks:
-                        self.input_jacks[io_id].state = InputState.IIdleDisconnected
-                        self.input_jacks[io_id]._set_led()
-                        if io_id in self.input_connections:
-                            self._stop_receiver(io_id)
-                            self.input_connections[io_id] = None
-                    continue
-
-                if io_id not in self.input_jacks:
-                    continue
-
-                jack = self.input_jacks[io_id]
-                jack.connected_src        = conn_info["src_mod"]
-                jack.connected_src_io     = conn_info["src_io"]
-                jack.connected_mcast      = conn_info["mcast_group"]
-                jack.connected_offset     = conn_info.get("offset", 0)
-                jack.connected_block_size = conn_info.get("block_size", 96)
-
-                self._start_receiver(io_id,
-                                   conn_info["mcast_group"],
-                                   conn_info.get("offset", 0),
-                                   conn_info.get("block_size", 96))
-
-                self.input_connections[io_id] = ConnectionRecord(**conn_info)
-
-                jack.state = InputState.IIdleConnected
-                jack._set_led()
-
-            logger.info(f"[{self.module_id}] Patch restored via unicast")
-            
-
-        if msg.module_id == "mcu":
-            if msg.type == ProtocolMessageType.STATE_INQUIRY.value:
-                state = self.iterate_for_save()
-                resp = ProtocolMessage(ProtocolMessageType.STATE_RESPONSE.value, self.module_id, payload=state)
-                self.sock.sendto(resp.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
-
     def _audio_receive_loop(self):
         while True:
             try:

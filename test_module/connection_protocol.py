@@ -14,6 +14,7 @@ UDP_CONTROL_PORT = 5000
 UDP_AUDIO_PORT = 5005
 
 logger = logging.getLogger(__name__)
+print("=== LOADING CORRECT connection_protocol.py (2025-12-02 refactor) ===")
 
 # ===================================================================
 # ENUMS — exactly as in your CSV
@@ -259,7 +260,7 @@ class OutputJack:
             io_id=self.io_id,
             payload=payload
         )
-        self.module.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+        self.module.sock.sendto(msg.pack(), (self.module.control_group, UDP_CONTROL_PORT))
         logger.info(f"[{self.module.module_id}] INITIATE sent from {self.io_id} → {payload['group']} "
                     f"offset={payload['offset']} size={payload['block_size']}")
 
@@ -361,12 +362,26 @@ class OutputJack:
 
 class InputJack:
     def __init__(self, io_id: str, module):
-            self.io_id = io_id
-            self.module = module
-            self.state = InputState.IIdleDisconnected
-            self.connected_to: Optional[ConnectionRecord] = None  # single source of truth
-            self.type_ = module.inputs[io_id].get("type", "unknown")
-            self._set_led()
+        self.io_id = io_id
+        self.module = module                      # ← real OscModule / LfoModule
+        self.state = InputState.IIdleDisconnected
+        self.connected_to: Optional[ConnectionRecord] = None
+    
+        # Get the jack type (cv, audio, gate, etc.) from module definition
+        self.type_ = module.inputs[io_id].get("type", "unknown")
+        
+        # Optional: store reference to GUI widget if you want direct access
+        # self.widget = module.gui_leds.get(io_id)
+        
+        # Initial LED state
+        self._set_led()
+        
+        # Pending connection state (used during handshake)
+        self.pending_initiator = None
+        self.pending_initiator_io = None
+        self.pending_mcast = None
+        self.pending_offset = None
+    
 
     # ------------------------------------------------------------------
     #  ACCEPT A PENDING CONNECTION (called both from live use and restore)
@@ -467,7 +482,7 @@ class InputJack:
     def long_press(self):
         if self.state == InputState.ISelfCompatible:
             logger.info(f"[{self.module.module_id}] Input {self.io_id} long press — canceling advertising")
-            self.module._broadcast_cancel()
+            self.module.connection_protocol._broadcast_cancel()
             self.state = InputState.IIdleDisconnected
             self._set_led()
 
@@ -486,7 +501,7 @@ class InputJack:
             ProtocolMessageType.COMPATIBLE.value,
             self.module.module_id, self.module.type, self.io_id, payload
         )
-        self.module.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+        self.module.sock.sendto(msg.pack(), (self.module.control_group, UDP_CONTROL_PORT))
     
     def _send_reveal(self):
             rec = self.module.input_connections.get(self.io_id)
@@ -497,7 +512,7 @@ class InputJack:
                 ProtocolMessageType.SHOW_CONNECTED.value,
                 self.module.module_id, self.module.type, self.io_id, payload
             )
-            self.module.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+            self.module.sock.sendto(msg.pack(), (self.module.control_group, UDP_CONTROL_PORT))
             logger.info(f"[{self.module.module_id}] REVEAL sent for {self.io_id} → {rec.src}")
 
    
@@ -592,26 +607,29 @@ class InputJack:
 # ===================================================================
 
 class ConnectionProtocol:
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # These are required for:
-        # - Patch save/restore
-        # - InputJack._accept_connection()
-        # - _refresh_gui_from_controls()
+    def __init__(self, module):
+        # module is the real OscModule / LfoModule / AudioOutModule
+        self.module = module
+        self.sock = module.sock
+        self.module_id = module.module_id
+        
         self.input_connections: Dict[str, Optional[ConnectionRecord]] = {}
         self.output_jacks: Dict[str, OutputJack] = {}
         self.input_jacks: Dict[str, InputJack] = {}
-
+            
     def _ensure_io_defs(self):
-        """Call after inputs/outputs are defined — creates per-jack state machines and sets initial LEDs"""
-        # Build jack state machines
-        self.output_jacks = {io: OutputJack(io, self) for io in self.outputs}
-        self.input_jacks  = {io: InputJack(io, self)  for io in self.inputs}
-
-        # Initial LED state is set by each jack's __init__ → no extra call needed
-        # Old code removed: self._sync_initial_leds()  ← DELETE THIS LINE
-        logger.debug(f"[{self.module_id}] Per-jack state machines initialized")
-
+        """Create per-jack state machines from the parent module's I/O definitions."""
+        mod = self.module
+    
+        self.output_jacks = {
+            io_id: OutputJack(io_id, mod) for io_id in mod.outputs
+        }
+        self.input_jacks = {
+            io_id: InputJack(io_id, mod) for io_id in mod.inputs
+        }
+    
+        logger.debug(f"[{self.module_id}] Created {len(self.input_jacks)} input jacks, "
+                     f"{len(self.output_jacks)} output jacks")
 
 
     def _notify_self_compatible(self, io_id: str):
@@ -622,7 +640,7 @@ class ConnectionProtocol:
 
     def _broadcast_cancel(self):
         msg = ProtocolMessage(ProtocolMessageType.CANCEL.value, self.module_id)
-        self.sock.sendto(msg.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+        self.sock.sendto(msg.pack(), (self.module.control_group, UDP_CONTROL_PORT))
 
     # User actions
     def initiate_connect(self, io_id: str):
@@ -663,7 +681,7 @@ class ConnectionProtocol:
                     self.module_id,
                     payload=state
                     )
-                self.sock.sendto(resp.pack(), (CONTROL_MULTICAST, UDP_CONTROL_PORT))
+                self.sock.sendto(resp.pack(), (self.module.control_group, UDP_CONTROL_PORT))
                 logger.info(f"[{self.module_id}] Sent STATE_RESPONSE for save")
         elif msg.type == ProtocolMessageType.SHOW_CONNECTED.value:
             if msg.io_id in self.output_jacks:

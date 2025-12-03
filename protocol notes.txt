@@ -251,7 +251,7 @@ This table supersedes any earlier conflicting description in the document.
 
  It 100% should not be rejecting an offer to INITIATE a connection because the group doesn't match something! The only thing that makes an output compatible with an input (or not) is the type of data (we will later perhaps have a list of types, so an envelope could accept a trigger or a gate)
  
- additional note, this is the latest updated version of the state table in CSV format, just a few changes from what is described above.  Note new REVEAL message from previous version, and now a new state, IOtherCompatible, the purpose of which is to prevent a confusing situation in which multiple inputs are in ISelfCompatible.  Another change: note the CONNECTED message is removed, as not helpful, and the transition from IIdleConnected on an INITIATE is now more complicated, and depends not just on the TYPE field of the INITIATE but also the GROUP and OFFSET (so we know if the INITIATE came from the exact output to which we are connected)
+ additional note, this is the latest updated version of the state table in CSV format, just a few changes from what is described above.  Note new REVEAL message from previous version, and now a new state, IOtherCompatible, the purpose of which is to prevent a confusing situation in which multiple inputs are in ISelfCompatible.  Another change: note the CONNECTED message is removed, as not helpful, and the transition from IIdleConnected on an INITIATE is now more complicated, and depends not just on the TYPE field of the INITIATE but also the GROUP and OFFSET (so we know if the INITIATE came from the exact output to which we are connected), and another fix, go back to IIdleConncted on a CANCEL from IOtherPending, and some more fixes in version 5 below.
  
  ,,,,,,,
  ,Short press,Long Press,Initiate,Cancel,Compatible,Reveal,LED Status
@@ -261,11 +261,11 @@ This table supersedes any earlier conflicting description in the document.
  OCompatible,Send Initiate goto OSelfPending,Send CANCEL goto OIdle,Go to OOtherPending,Goto OIdle,Nothing,"Check if I am the output connected to the message sender, if so blink fast for three seconds",On
  ONotCompatible,Nothing,Send CANCEL goto OIdle,Go to OOtherPending,Goto OIdle,Nothing,"Check if I am the output connected to the message sender, if so blink fast for three seconds",Off
  ,,,,,,,
- IIdleDisconnected,Send Compatible goto ISelfCompatible,Nothing,"Check. If compatible, go to IPending, if not go to IOtherPending",Nothing,Go to IOtherCompatible,Nothing (leds already off),Off
- ISelfCompatible,Nothing,Send CANCEL goto IIdleDisconnected,"Check. If compatible, go to IPending, if not go to IOtherPending",Goto IIdle,Nothing,Turn LED off for three seconds to make flashing more visible,On
- IPending,"Send Connected, Celebrate connection, Connect*, then goto IPendingSame",Nothing,"Check. If compatible, stay in IPending, if not go to IOtherPending (should not happen)",Goto IIdleDisconnected,Nothing,Turn LED off for three seconds to make flashing more visible,On
+ IIdleDisconnected,Send Compatible goto ISelfCompatible,Nothing,"Check. If compatible, go to IPending, if not go to IOtherCompatible",Nothing,Go to IOtherCompatible,Nothing (leds already off),Off
+ ISelfCompatible,Nothing,Send CANCEL goto IIdleDisconnected,"Check. If compatible, go to IPending, if not go to IOtherCompatible",Goto IIdle,Nothing,Turn LED off for three seconds to make flashing more visible,On
+ IPending,"Send Connected, Celebrate connection, Connect*, then goto IPendingSame",Nothing,"Check. If compatible, stay in IPending, if not go to IOtherCompatible (should not happen)",Goto IIdleDisconnected,Nothing,Turn LED off for three seconds to make flashing more visible,On
  IIdleConnected,"Reveal Connection: send REVEAL message with IP ADDRESS of connected output , all others go dark, connection blinks fast in sync with this","Remove Connection**, goto IIdleDisconnected","If INITIATE matches our connection exactly, TYPE and GROUP and OFFSET then transition to IPendingSame If INITIATE matches only on TYPE do nothing.  If INITIATE does not match on TYPE go to IOtherPending",Nothing,Nothing,Turn LED off for three seconds to make flashing more visible — BUT NOT IF I SENT THE MESSAGE,Fast blinking
- IOtherPending,Nothing,nothing,Nothing,Go to IIdleDisconnected,Nothing,Nothing (leds already off),Off
+ IOtherPending,Nothing,nothing,Nothing,Go to IIdleConnected,Nothing,Nothing (leds already off),Off
  IPendingSame,Nothing,"Remove Connection**, goto IIdleDisconnected","This should not happen, but: Nothing if INITIATE matches match, if it does, transition to IIdleConnected",Go to IIdleConnected,Nothing,Turn LED off for three seconds to make flashing more visible,Slow blinking
  IOtherCompatible,Nothing (no second compatible),Send CANCEL goto IIdleDisconnected,"Check. If compatible, go to IPending, if not go to IOtherPending",Goto IIdleDisconnected,Nothing,Nothing (leds already off),Off
  
